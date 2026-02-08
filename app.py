@@ -411,13 +411,6 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
                 sources=["webcam"],
                 streaming=True,
                 height=320,
-                webcam_constraints={
-                    "video": {
-                        "width": {"ideal": 640},
-                        "height": {"ideal": 360},
-                        "frameRate": {"ideal": 24, "max": 30},
-                    }
-                },
             )
             conf_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="Confidence threshold")
             iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
@@ -433,6 +426,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
         inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider],
         outputs=[result, stats],
         show_progress="hidden",
+        show_api=False,
         queue=False,
         trigger_mode="always_last",
         concurrency_limit=1,
