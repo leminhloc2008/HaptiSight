@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Tuple
@@ -280,42 +281,103 @@ class RealtimeEngine:
 
 
 ENGINE = None
-ENGINE_ERROR = None
+ASYNC_WORKER = None
 
 
 def get_engine() -> RealtimeEngine:
-    global ENGINE, ENGINE_ERROR
+    global ENGINE
     if ENGINE is not None:
         return ENGINE
-    if ENGINE_ERROR is not None:
-        raise RuntimeError(ENGINE_ERROR)
-    try:
-        ENGINE = RealtimeEngine()
-        return ENGINE
-    except Exception as exc:
-        ENGINE_ERROR = str(exc)
-        raise
+    ENGINE = RealtimeEngine()
+    return ENGINE
+
+
+class AsyncInferenceWorker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending_frame = None
+        self._pending_params = None
+        self._pending_seq = 0
+        self._done_seq = 0
+        self._latest_frame = None
+        self._latest_stats = "Dang tai model..."
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, frame, conf_thres, iou_thres, img_size, max_det, smooth_factor):
+        frame = downscale_frame(frame, MAX_FRAME_EDGE)
+        params = (
+            float(conf_thres),
+            float(iou_thres),
+            int(img_size),
+            int(max_det),
+            float(smooth_factor),
+        )
+        with self._lock:
+            self._pending_frame = frame
+            self._pending_params = params
+            self._pending_seq += 1
+            latest_frame = self._latest_frame
+            latest_stats = self._latest_stats
+
+        # Return immediately: no blocking on model inference in request path.
+        if latest_frame is None:
+            return frame, latest_stats
+        return latest_frame, latest_stats
+
+    def _run(self):
+        engine = None
+        while True:
+            with self._lock:
+                has_new = self._pending_frame is not None and self._pending_seq > self._done_seq
+                if has_new:
+                    seq = self._pending_seq
+                    frame = self._pending_frame.copy()
+                    params = self._pending_params
+                else:
+                    seq = 0
+                    frame = None
+                    params = None
+
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            if engine is None:
+                try:
+                    engine = get_engine()
+                except Exception as exc:
+                    with self._lock:
+                        self._latest_stats = f"Loi khoi tao model: {exc}"
+                    time.sleep(0.2)
+                    continue
+
+            try:
+                out_frame, stats = engine.infer(frame, *params)
+            except Exception as exc:
+                out_frame = frame
+                stats = f"Loi infer: {exc}"
+
+            with self._lock:
+                if seq >= self._done_seq:
+                    self._done_seq = seq
+                    self._latest_frame = out_frame
+                    self._latest_stats = stats
+
+
+def get_async_worker() -> AsyncInferenceWorker:
+    global ASYNC_WORKER
+    if ASYNC_WORKER is None:
+        ASYNC_WORKER = AsyncInferenceWorker()
+    return ASYNC_WORKER
 
 
 def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor):
     if frame is None:
         return None, "Dang cho frame webcam..."
 
-    try:
-        engine = get_engine()
-    except Exception as exc:
-        return frame, f"Loi khoi tao model: {exc}"
-
-    frame = downscale_frame(frame, MAX_FRAME_EDGE)
-
-    return engine.infer(
-        frame_rgb=frame,
-        conf_thres=float(conf_thres),
-        iou_thres=float(iou_thres),
-        img_size=int(img_size),
-        max_det=int(max_det),
-        smooth_factor=float(smooth_factor),
-    )
+    worker = get_async_worker()
+    return worker.submit(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor)
 
 
 DESCRIPTION = (
@@ -345,17 +407,25 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
+                format="jpeg",
                 sources=["webcam"],
                 streaming=True,
-                height=360,
+                height=320,
+                webcam_constraints={
+                    "video": {
+                        "width": {"ideal": 640},
+                        "height": {"ideal": 360},
+                        "frameRate": {"ideal": 24, "max": 30},
+                    }
+                },
             )
-            conf_slider = gr.Slider(0.10, 0.90, value=0.40, step=0.01, label="Confidence threshold")
+            conf_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="Confidence threshold")
             iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
-            size_slider = gr.Slider(224, 512, value=320, step=32, label="Inference image size")
-            max_det_slider = gr.Slider(1, 60, value=12, step=1, label="Max detections")
+            size_slider = gr.Slider(192, 512, value=256, step=32, label="Inference image size")
+            max_det_slider = gr.Slider(1, 60, value=8, step=1, label="Max detections")
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", height=360)
+            result = gr.Image(label="Result", type="numpy", format="jpeg", height=320)
             stats = gr.Textbox(label="Runtime stats")
 
     webcam.stream(
@@ -366,7 +436,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
         queue=False,
         trigger_mode="always_last",
         concurrency_limit=1,
-        stream_every=0.05,
+        stream_every=0.033,
     )
 
 
