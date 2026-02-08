@@ -1,5 +1,6 @@
 import os
 import sys
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -421,16 +422,21 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=320)
             stats = gr.Textbox(label="Runtime stats")
 
+    stream_kwargs = {
+        "show_progress": "hidden",
+        "queue": False,
+        "trigger_mode": "always_last",
+        "concurrency_limit": 1,
+        "stream_every": 0.033,
+        "show_api": False,
+    }
+    supported_stream_args = set(inspect.signature(webcam.stream).parameters.keys())
+    stream_kwargs = {k: v for k, v in stream_kwargs.items() if k in supported_stream_args}
     webcam.stream(
         process_frame,
         inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider],
         outputs=[result, stats],
-        show_progress="hidden",
-        show_api=False,
-        queue=False,
-        trigger_mode="always_last",
-        concurrency_limit=1,
-        stream_every=0.033,
+        **stream_kwargs,
     )
 
 
