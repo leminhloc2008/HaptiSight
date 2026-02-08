@@ -3,6 +3,7 @@ import sys
 import inspect
 import threading
 import time
+import json
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -37,6 +38,7 @@ if str(YOLO_DIR) not in sys.path:
 
 from models.experimental import attempt_load  # noqa: E402
 from utils.general import check_img_size, non_max_suppression, scale_coords  # noqa: E402
+from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
 
 
 def letterbox(img, new_shape=640, color=(114, 114, 114), auto=False, scale_fill=False, scaleup=True, stride=32):
@@ -355,7 +357,7 @@ class RealtimeEngine:
         depth_enabled: bool,
         depth_alpha: float,
         depth_interval: int,
-    ) -> Tuple[np.ndarray, str]:
+    ) -> Tuple[np.ndarray, str, Dict[str, object]]:
         start = time.perf_counter()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         infer_frame_bgr = frame_bgr.copy()
@@ -390,6 +392,7 @@ class RealtimeEngine:
 
         nearest_info = None
         fusion_w_mean = None
+        scene_objects = []
         if len(det):
             det = det.clone()
             det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], frame_bgr.shape).round()
@@ -466,6 +469,18 @@ class RealtimeEngine:
                     "z": z,
                     "d": d3,
                 }
+                scene_objects.append(
+                    {
+                        "name": self.names[cls_id],
+                        "conf": round(float(conf), 4),
+                        "bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
+                        "distance_m": round(float(smoothed), 3),
+                        "distance3d_m": round(float(d3), 3),
+                        "xyz_m": [round(float(x3), 3), round(float(y3), 3), round(float(z), 3)],
+                        "depth_rel": round(float(depth_vals[idx]), 4) if depth_vals is not None else None,
+                        "fusion_w": round(float(fusion_w_vals[idx]), 4) if fusion_w_vals is not None else None,
+                    }
+                )
                 if nearest_info is None or obj["d"] < nearest_info["d"]:
                     nearest_info = obj
 
@@ -515,7 +530,15 @@ class RealtimeEngine:
                 stats += f" | depth_err={depth_error}"
         result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
-        return result_rgb, stats
+        scene_state = {
+            "timestamp": time.time(),
+            "image_size": [int(img_w), int(img_h)],
+            "profile_fov_deg": CAM_FOV_DEG,
+            "objects": scene_objects,
+            "nearest": nearest_info,
+            "depth_enabled": bool(depth_enabled),
+        }
+        return result_rgb, stats, scene_state
 
     @staticmethod
     def _draw_box(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, label: str, color: Tuple[int, int, int]) -> None:
@@ -550,6 +573,7 @@ class AsyncInferenceWorker:
         self._done_seq = 0
         self._latest_frame = None
         self._latest_stats = "Dang tai model..."
+        self._latest_scene = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -576,6 +600,10 @@ class AsyncInferenceWorker:
         if latest_frame is None:
             return frame, latest_stats
         return latest_frame, latest_stats
+
+    def latest_scene(self):
+        with self._lock:
+            return self._latest_scene
 
     def _run(self):
         engine = None
@@ -606,16 +634,18 @@ class AsyncInferenceWorker:
 
             try:
                 with ENGINE_LOCK:
-                    out_frame, stats = engine.infer(frame, *params)
+                    out_frame, stats, scene_state = engine.infer(frame, *params)
             except Exception as exc:
                 out_frame = frame
                 stats = f"Loi infer: {exc}"
+                scene_state = None
 
             with self._lock:
                 if seq >= self._done_seq:
                     self._done_seq = seq
                     self._latest_frame = out_frame
                     self._latest_stats = stats
+                    self._latest_scene = scene_state
 
 
 def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, depth_enabled, depth_alpha, depth_interval, session_worker):
@@ -687,6 +717,140 @@ def apply_profile(profile_name: str):
     )
 
 
+def _build_local_fallback_plan(user_query: str, scene_state: Dict[str, object]) -> Dict[str, object]:
+    objects = (scene_state or {}).get("objects") or []
+    nearest = (scene_state or {}).get("nearest") or {}
+    target_name = nearest.get("name") if isinstance(nearest, dict) else "target object"
+    if objects and not target_name:
+        target_name = objects[0].get("name", "target object")
+
+    if not objects:
+        return {
+            "intent_agent": {"task": user_query or "Reach requested object", "target_object": "unknown", "confidence": 0.2},
+            "spatial_agent": {"target_visible": False, "target_xyz_m": [0.0, 0.0, 0.0], "target_distance_m": -1.0, "recommended_approach": "Scan left-center-right slowly."},
+            "safety_agent": {
+                "risk_level": "medium",
+                "hazards": ["Target not visible."],
+                "collision_objects": [],
+                "safety_rules": ["Move slowly.", "Stop if contact is uncertain."],
+            },
+            "path_agent": {
+                "micro_steps": ["Raise camera slightly.", "Sweep scene slowly.", "Stop when target appears and re-plan."],
+                "stop_conditions": ["No target detected for 5 seconds."],
+                "fallback_actions": ["Ask nearby person for scene repositioning support."],
+            },
+            "final_guidance": {
+                "summary": "Target is not visible now.",
+                "speakable_guidance": ["Target not visible.", "Scan left to right slowly.", "Stop and retry after target appears."],
+            },
+        }
+
+    x = float(nearest.get("x", 0.0))
+    y = float(nearest.get("y", 0.0))
+    z = float(nearest.get("z", 0.0))
+    d = float(nearest.get("d", z))
+    horizontal = "left" if x < -0.2 else ("right" if x > 0.2 else "center")
+    vertical = "up" if y < -0.15 else ("down" if y > 0.15 else "center")
+
+    steps = [
+        f"Orient hand toward {horizontal} side.",
+        f"Adjust hand vertically {vertical}.",
+        f"Move forward about {max(0.1, d - 0.35):.2f} meters slowly.",
+        "Open fingers and grasp gently.",
+    ]
+    return {
+        "intent_agent": {"task": user_query or f"Reach {target_name}", "target_object": target_name, "confidence": 0.7},
+        "spatial_agent": {
+            "target_visible": True,
+            "target_xyz_m": [round(x, 3), round(y, 3), round(z, 3)],
+            "target_distance_m": round(d, 3),
+            "recommended_approach": f"Approach from {horizontal}-{vertical} with slow straight-line reach.",
+        },
+        "safety_agent": {
+            "risk_level": "medium" if d < 0.7 else "low",
+            "hazards": ["Potential clutter near target."],
+            "collision_objects": [o.get("name") for o in objects[:3] if o.get("name") != target_name],
+            "safety_rules": ["Slow speed.", "Pause every 10-15 cm.", "Do not sweep sideways quickly."],
+        },
+        "path_agent": {
+            "micro_steps": steps,
+            "stop_conditions": ["Target leaves center view.", "Unexpected contact before reaching target."],
+            "fallback_actions": ["Pull hand back 10 cm.", "Re-center camera and retry."],
+        },
+        "final_guidance": {
+            "summary": f"Nearest target is {target_name} at about {d:.2f} m.",
+            "speakable_guidance": [
+                f"{target_name} detected.",
+                f"Move {horizontal}, then {vertical}.",
+                f"Reach forward about {max(0.1, d - 0.35):.2f} meters slowly.",
+            ],
+        },
+    }
+
+
+def _render_plan_markdown(plan: Dict[str, object], model_used: str, latency_ms: float, fallback_used: bool) -> str:
+    final = plan.get("final_guidance", {}) if isinstance(plan, dict) else {}
+    path = plan.get("path_agent", {}) if isinstance(plan, dict) else {}
+    safety = plan.get("safety_agent", {}) if isinstance(plan, dict) else {}
+    speak = final.get("speakable_guidance", []) if isinstance(final, dict) else []
+    steps = path.get("micro_steps", []) if isinstance(path, dict) else []
+    hazards = safety.get("hazards", []) if isinstance(safety, dict) else []
+
+    lines = [
+        f"Model: `{model_used}` | latency: `{latency_ms:.1f} ms` | fallback: `{fallback_used}`",
+        "",
+        f"Summary: {final.get('summary', 'N/A') if isinstance(final, dict) else 'N/A'}",
+        "",
+        "Speakable guidance:",
+    ]
+    for s in speak[:5]:
+        lines.append(f"- {s}")
+    lines.append("")
+    lines.append("Micro steps:")
+    for s in steps[:7]:
+        lines.append(f"- {s}")
+    if hazards:
+        lines.append("")
+        lines.append("Hazards:")
+        for h in hazards[:5]:
+            lines.append(f"- {h}")
+    return "\n".join(lines)
+
+
+def run_smart_planner(user_query: str, profile_name: str, api_key_input: str, session_worker):
+    if session_worker is None:
+        msg = "Chua co scene state. Bat webcam truoc, doi 1-2s roi plan lai."
+        return msg, "{}", session_worker
+
+    scene_state = session_worker.latest_scene()
+    if not scene_state:
+        msg = "Scene state trong. Hay de webcam chay them mot chut roi bam plan."
+        return msg, "{}", session_worker
+
+    planner = GeminiMultiAgentPlanner(api_key=api_key_input.strip() if api_key_input else None)
+    result = planner.plan(
+        user_query=user_query.strip() if user_query else "Reach the requested object safely.",
+        scene_state=scene_state,
+        profile_name=profile_name,
+        fov_deg=CAM_FOV_DEG,
+    )
+
+    fallback_used = False
+    if result.ok:
+        plan = result.output
+        model_used = result.model
+        latency_ms = result.latency_ms
+    else:
+        fallback_used = True
+        plan = _build_local_fallback_plan(user_query, scene_state)
+        model_used = "local-fallback"
+        latency_ms = 0.0
+
+    md = _render_plan_markdown(plan, model_used, latency_ms, fallback_used)
+    js = json.dumps(plan, ensure_ascii=False, indent=2)
+    return md, js, session_worker
+
+
 DESCRIPTION = (
     "YOLOER V2 tren Hugging Face Spaces (CPU realtime webcam). "
     "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt. "
@@ -717,6 +881,16 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
                 value="Balanced",
                 label="Performance profile",
             )
+            task_query = gr.Textbox(
+                label="Task query for smart agent",
+                value="Help me safely reach the nearest cup on the table.",
+                lines=2,
+            )
+            gemini_api_key = gr.Textbox(
+                label="Gemini API key (optional, session only)",
+                type="password",
+                placeholder="Leave empty to use GEMINI_API_KEY env",
+            )
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
@@ -736,6 +910,9 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
+            plan_btn = gr.Button("Generate Smart Guidance (Gemini)")
+            plan_md = gr.Markdown("Guidance plan will appear here.")
+            plan_json = gr.Code(label="Planner JSON", language="json")
     session_worker = gr.State(value=None)
 
     profile.change(
@@ -779,6 +956,13 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
         ],
         outputs=[result, stats, session_worker],
         **stream_kwargs,
+    )
+
+    plan_btn.click(
+        run_smart_planner,
+        inputs=[task_query, profile, gemini_api_key, session_worker],
+        outputs=[plan_md, plan_json, session_worker],
+        queue=False,
     )
 
 
