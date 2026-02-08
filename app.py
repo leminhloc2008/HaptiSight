@@ -12,11 +12,13 @@ import h5py
 import numpy as np
 import requests
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
 MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "512"))
 MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
+MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "384"))
 
 # PyTorch >= 2.6 defaults torch.load(..., weights_only=True), which breaks legacy YOLOv7 checkpoints.
 _ORIG_TORCH_LOAD = torch.load
@@ -90,6 +92,58 @@ class DistanceMLP:
         return out
 
 
+class MidasDepthEstimator:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.model = None
+        self.transform = None
+        self.error_message = None
+
+    @staticmethod
+    def _hub_load(repo: str, model_name: str):
+        try:
+            return torch.hub.load(repo, model_name, trust_repo=True)
+        except TypeError:
+            return torch.hub.load(repo, model_name)
+
+    def ensure_loaded(self):
+        if self.model is not None and self.transform is not None:
+            return
+        if self.error_message is not None:
+            raise RuntimeError(self.error_message)
+
+        try:
+            torch.hub.set_dir(str(ROOT / ".torch_hub_cache"))
+            self.model = self._hub_load("intel-isl/MiDaS", "MiDaS_small")
+            transforms = self._hub_load("intel-isl/MiDaS", "transforms")
+            self.transform = transforms.small_transform
+            self.model.to(self.device).eval()
+        except Exception as exc:
+            self.error_message = f"Khong tai duoc MiDaS_small: {exc}"
+            raise RuntimeError(self.error_message)
+
+    def predict(self, frame_rgb: np.ndarray, max_edge: int) -> np.ndarray:
+        self.ensure_loaded()
+        frame_input = downscale_frame(frame_rgb, max_edge)
+
+        with torch.inference_mode():
+            inp = self.transform(frame_input).to(self.device)
+            pred = self.model(inp)
+            pred = F.interpolate(
+                pred.unsqueeze(1),
+                size=frame_rgb.shape[:2],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(1).squeeze(0)
+
+        depth = pred.detach().cpu().numpy().astype(np.float32)
+        lo, hi = np.percentile(depth, [2, 98])
+        if hi - lo < 1e-6:
+            return np.zeros_like(depth, dtype=np.float32)
+        depth = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
+        return depth
+
+
 class RealtimeEngine:
     ORIG_HEIGHT = 375.0
     ORIG_WIDTH = 1242.0
@@ -123,6 +177,10 @@ class RealtimeEngine:
         rng = np.random.default_rng(7)
         self.colors = rng.integers(0, 255, size=(len(self.names), 3), dtype=np.uint8)
         self.distance_cache: Dict[str, float] = {}
+        self.depth_estimator = None
+        self.depth_last_map = None
+        self.depth_last_latency_ms = 0.0
+        self.depth_frame_counter = 0
 
     def _resolve_weights_path(self) -> Path:
         env_weight = os.getenv("YOLO_WEIGHTS", "").strip()
@@ -195,6 +253,42 @@ class RealtimeEngine:
         pred = (pred_norm * y_std) + y_mean
         return np.maximum(pred.reshape(-1), 0.0)
 
+    @staticmethod
+    def _sample_box_depth(depth_map: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+        if depth_map is None:
+            return -1.0
+        h, w = depth_map.shape[:2]
+        x1 = int(np.clip(x1, 0, w - 1))
+        x2 = int(np.clip(x2, 0, w - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
+        y2 = int(np.clip(y2, 0, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            return float(depth_map[y1, x1])
+        roi = depth_map[y1:y2, x1:x2]
+        if roi.size == 0:
+            return float(depth_map[y1, x1])
+        return float(np.median(roi))
+
+    def _get_depth_map(self, frame_rgb: np.ndarray, depth_enabled: bool, depth_interval: int):
+        if not depth_enabled:
+            self.depth_last_map = None
+            return None, None
+
+        self.depth_frame_counter += 1
+        depth_interval = max(1, int(depth_interval))
+        refresh = self.depth_last_map is None or (self.depth_frame_counter % depth_interval == 0)
+        if not refresh:
+            return self.depth_last_map, None
+
+        if self.depth_estimator is None:
+            self.depth_estimator = MidasDepthEstimator(self.device)
+
+        t0 = time.perf_counter()
+        depth_map = self.depth_estimator.predict(frame_rgb, MAX_DEPTH_EDGE)
+        self.depth_last_latency_ms = (time.perf_counter() - t0) * 1000.0
+        self.depth_last_map = depth_map
+        return depth_map, None
+
     def infer(
         self,
         frame_rgb: np.ndarray,
@@ -203,11 +297,23 @@ class RealtimeEngine:
         img_size: int,
         max_det: int,
         smooth_factor: float,
+        depth_enabled: bool,
+        depth_alpha: float,
+        depth_interval: int,
     ) -> Tuple[np.ndarray, str]:
         start = time.perf_counter()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         img_h, img_w = frame_bgr.shape[:2]
         img_size = check_img_size(int(img_size), s=self.stride)
+
+        depth_map = None
+        depth_error = None
+        if depth_enabled:
+            try:
+                depth_map, _ = self._get_depth_map(frame_rgb, depth_enabled, depth_interval)
+            except Exception as exc:
+                depth_error = str(exc)
+                depth_map = None
 
         padded = letterbox(frame_bgr, new_shape=img_size, stride=self.stride, auto=False)[0]
         padded = padded[:, :, ::-1].transpose(2, 0, 1)
@@ -252,7 +358,11 @@ class RealtimeEngine:
                 smoothed = smooth_factor * prev_dist + (1.0 - smooth_factor) * raw_dist
                 new_cache[key] = smoothed
 
-                label = f"{self.names[cls_id]} {smoothed:.1f}m ({conf:.2f})"
+                if depth_map is not None:
+                    depth_val = self._sample_box_depth(depth_map, x1, y1, x2, y2)
+                    label = f"{self.names[cls_id]} {smoothed:.1f}m z{depth_val:.2f} ({conf:.2f})"
+                else:
+                    label = f"{self.names[cls_id]} {smoothed:.1f}m ({conf:.2f})"
                 color = tuple(int(c) for c in self.colors[cls_id])
                 self._draw_box(frame_bgr, x1, y1, x2, y2, label, color)
 
@@ -262,12 +372,24 @@ class RealtimeEngine:
             self.distance_cache = {}
             object_count = 0
 
+        if depth_map is not None and depth_alpha > 0:
+            depth_uint8 = (np.clip(depth_map, 0.0, 1.0) * 255.0).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
+            alpha = float(np.clip(depth_alpha, 0.0, 0.8))
+            frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
+
         latency_ms = (time.perf_counter() - start) * 1000.0
         fps = 1000.0 / max(latency_ms, 1e-6)
         stats = (
             f"weights={self.weights_path.name} | objects={object_count} | "
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
+        if depth_enabled:
+            stats += f" | depth_every={max(1, int(depth_interval))}"
+            if self.depth_last_latency_ms > 0:
+                stats += f" | depth={self.depth_last_latency_ms:.1f}ms"
+            if depth_error:
+                stats += f" | depth_err={depth_error}"
         result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
         return result_rgb, stats
@@ -308,7 +430,7 @@ class AsyncInferenceWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, frame, conf_thres, iou_thres, img_size, max_det, smooth_factor):
+    def submit(self, frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, depth_enabled, depth_alpha, depth_interval):
         frame = downscale_frame(frame, MAX_FRAME_EDGE)
         params = (
             float(conf_thres),
@@ -316,6 +438,9 @@ class AsyncInferenceWorker:
             int(img_size),
             int(max_det),
             float(smooth_factor),
+            bool(depth_enabled),
+            float(depth_alpha),
+            int(depth_interval),
         )
         with self._lock:
             self._pending_frame = frame
@@ -370,14 +495,24 @@ class AsyncInferenceWorker:
                     self._latest_stats = stats
 
 
-def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, session_worker):
+def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, depth_enabled, depth_alpha, depth_interval, session_worker):
     if frame is None:
         return None, "Dang cho frame webcam...", session_worker
 
     if session_worker is None:
         session_worker = AsyncInferenceWorker()
 
-    out_frame, out_stats = session_worker.submit(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor)
+    out_frame, out_stats = session_worker.submit(
+        frame,
+        conf_thres,
+        iou_thres,
+        img_size,
+        max_det,
+        smooth_factor,
+        depth_enabled,
+        depth_alpha,
+        depth_interval,
+    )
     return out_frame, out_stats, session_worker
 
 
@@ -418,6 +553,9 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             size_slider = gr.Slider(192, 512, value=224, step=32, label="Inference image size")
             max_det_slider = gr.Slider(1, 60, value=8, step=1, label="Max detections")
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
+            depth_enabled = gr.Checkbox(value=False, label="Enable MiDaS v2.1 Small depth")
+            depth_alpha = gr.Slider(0.0, 0.7, value=0.22, step=0.01, label="Depth overlay alpha")
+            depth_interval = gr.Slider(1, 6, value=3, step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
@@ -435,7 +573,18 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
     stream_kwargs = {k: v for k, v in stream_kwargs.items() if k in supported_stream_args}
     webcam.stream(
         process_frame,
-        inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider, session_worker],
+        inputs=[
+            webcam,
+            conf_slider,
+            iou_slider,
+            size_slider,
+            max_det_slider,
+            smooth_slider,
+            depth_enabled,
+            depth_alpha,
+            depth_interval,
+            session_worker,
+        ],
         outputs=[result, stats, session_worker],
         **stream_kwargs,
     )
