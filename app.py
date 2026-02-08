@@ -15,7 +15,8 @@ import torch
 
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
-MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "640"))
+MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "512"))
+MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
 
 # PyTorch >= 2.6 defaults torch.load(..., weights_only=True), which breaks legacy YOLOv7 checkpoints.
 _ORIG_TORCH_LOAD = torch.load
@@ -267,7 +268,9 @@ class RealtimeEngine:
             f"weights={self.weights_path.name} | objects={object_count} | "
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
-        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), stats
+        result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
+        return result_rgb, stats
 
     @staticmethod
     def _draw_box(img: np.ndarray, x1: int, y1: int, x2: int, y2: int, label: str, color: Tuple[int, int, int]) -> None:
@@ -411,15 +414,15 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
                 format="jpeg",
                 sources=["webcam"],
                 streaming=True,
-                height=320,
+                height=300,
             )
             conf_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="Confidence threshold")
             iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
-            size_slider = gr.Slider(192, 512, value=256, step=32, label="Inference image size")
+            size_slider = gr.Slider(192, 512, value=224, step=32, label="Inference image size")
             max_det_slider = gr.Slider(1, 60, value=8, step=1, label="Max detections")
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", format="jpeg", height=320)
+            result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
 
     stream_kwargs = {
