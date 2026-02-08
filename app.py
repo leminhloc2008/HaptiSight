@@ -8,6 +8,7 @@ import cv2
 import gradio as gr
 import h5py
 import numpy as np
+import requests
 import torch
 
 ROOT = Path(__file__).resolve().parent
@@ -88,6 +89,16 @@ class DistanceMLP:
 class RealtimeEngine:
     ORIG_HEIGHT = 375.0
     ORIG_WIDTH = 1242.0
+    WEIGHTS_URLS = {
+        "yolov7-tiny.pt": [
+            "https://huggingface.co/akhaliq/yolov7/resolve/main/yolov7-tiny.pt",
+            "https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-tiny.pt",
+        ],
+        "yolov7.pt": [
+            "https://huggingface.co/akhaliq/yolov7/resolve/main/yolov7.pt",
+            "https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7.pt",
+        ],
+    }
 
     def __init__(self):
         requested_threads = int(os.getenv("CPU_THREADS", "2"))
@@ -115,16 +126,52 @@ class RealtimeEngine:
         if env_weight:
             env_path = Path(env_weight)
             candidates.extend([env_path, ROOT / env_path, YOLO_DIR / env_path])
-        candidates.extend([YOLO_DIR / "yolov7-tiny.pt", YOLO_DIR / "yolov7.pt"])
+        candidates.extend([ROOT / "yolov7-tiny.pt", ROOT / "yolov7.pt", YOLO_DIR / "yolov7-tiny.pt", YOLO_DIR / "yolov7.pt"])
 
         for path in candidates:
             if path.is_file():
                 return path
 
-        # No local checkpoint: return a known filename so YOLOv7's attempt_download() can fetch it.
-        if env_weight:
-            return ROOT / Path(env_weight).name
-        return ROOT / "yolov7-tiny.pt"
+        if env_weight.lower().startswith(("http://", "https://")):
+            target = ROOT / Path(env_weight).name
+            self._download_file(env_weight, target)
+            return target
+
+        weight_name = Path(env_weight).name if env_weight else "yolov7-tiny.pt"
+        if weight_name not in self.WEIGHTS_URLS:
+            raise FileNotFoundError(
+                f"Khong tim thay weights local cho '{weight_name}'. "
+                "Dat YOLO_WEIGHTS la duong dan ton tai hoac URL hop le."
+            )
+
+        target = ROOT / weight_name
+        self._download_from_mirrors(weight_name, target)
+        return target
+
+    def _download_file(self, url: str, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".part")
+        with requests.get(url, stream=True, timeout=60) as response:
+            response.raise_for_status()
+            with open(tmp, "wb") as file_obj:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        file_obj.write(chunk)
+        if tmp.stat().st_size < 1_000_000:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"Downloaded file qua nho tu {url}")
+        tmp.replace(target)
+
+    def _download_from_mirrors(self, weight_name: str, target: Path) -> None:
+        errors = []
+        for url in self.WEIGHTS_URLS.get(weight_name, []):
+            try:
+                self._download_file(url, target)
+                return
+            except Exception as exc:
+                errors.append(f"{url} -> {exc}")
+        joined = "\n".join(errors) if errors else "Khong co mirror URL"
+        raise RuntimeError(f"Khong the tai weights {weight_name}. Chi tiet:\n{joined}")
 
     def _predict_distances(self, features: np.ndarray) -> np.ndarray:
         if features.size == 0:
