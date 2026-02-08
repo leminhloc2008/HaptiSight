@@ -285,7 +285,7 @@ class RealtimeEngine:
 
 
 ENGINE = None
-ASYNC_WORKER = None
+ENGINE_LOCK = threading.Lock()
 
 
 def get_engine() -> RealtimeEngine:
@@ -357,7 +357,8 @@ class AsyncInferenceWorker:
                     continue
 
             try:
-                out_frame, stats = engine.infer(frame, *params)
+                with ENGINE_LOCK:
+                    out_frame, stats = engine.infer(frame, *params)
             except Exception as exc:
                 out_frame = frame
                 stats = f"Loi infer: {exc}"
@@ -369,19 +370,15 @@ class AsyncInferenceWorker:
                     self._latest_stats = stats
 
 
-def get_async_worker() -> AsyncInferenceWorker:
-    global ASYNC_WORKER
-    if ASYNC_WORKER is None:
-        ASYNC_WORKER = AsyncInferenceWorker()
-    return ASYNC_WORKER
-
-
-def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor):
+def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, session_worker):
     if frame is None:
-        return None, "Dang cho frame webcam..."
+        return None, "Dang cho frame webcam...", session_worker
 
-    worker = get_async_worker()
-    return worker.submit(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor)
+    if session_worker is None:
+        session_worker = AsyncInferenceWorker()
+
+    out_frame, out_stats = session_worker.submit(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor)
+    return out_frame, out_stats, session_worker
 
 
 DESCRIPTION = (
@@ -424,21 +421,22 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
+    session_worker = gr.State(value=None)
 
     stream_kwargs = {
         "show_progress": "hidden",
         "queue": False,
         "trigger_mode": "always_last",
         "concurrency_limit": 1,
-        "stream_every": 0.033,
+        "stream_every": 0.04,
         "show_api": False,
     }
     supported_stream_args = set(inspect.signature(webcam.stream).parameters.keys())
     stream_kwargs = {k: v for k, v in stream_kwargs.items() if k in supported_stream_args}
     webcam.stream(
         process_frame,
-        inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider],
-        outputs=[result, stats],
+        inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider, session_worker],
+        outputs=[result, stats, session_worker],
         **stream_kwargs,
     )
 
