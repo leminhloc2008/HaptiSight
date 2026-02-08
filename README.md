@@ -34,6 +34,24 @@ Optional environment variables:
 
 - `YOLO_WEIGHTS`: custom weights path (absolute or relative)
 - `CPU_THREADS`: number of CPU threads for Torch (default: `2`)
+- `GEMINI_API_KEY`: key for Gemini smart multi-agent planner (optional)
+- `CAM_FOV_DEG`: camera horizontal FOV for XYZ projection (default: `70`)
+
+### 2.1) Smart Agent (Gemini)
+
+The app includes a Gemini-powered multi-agent planner for actionable guidance:
+
+- `query_reasoner`
+- `spatial_reasoner`
+- `safety_assessor`
+- `path_planner`
+
+This planner runs on-demand from UI button `Generate Smart Guidance (Gemini)` and consumes current realtime scene state (objects + fused depth distance + XYZ).
+
+For zero-cost operation:
+
+- Use Google AI Studio free-tier model (`gemini-2.0-flash-lite` / `gemini-1.5-flash`).
+- Keep calls on-demand only (not per-frame), as implemented in this app.
 
 ### 3) Local run
 
