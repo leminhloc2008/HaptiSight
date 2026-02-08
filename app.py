@@ -13,6 +13,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
+MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "640"))
 
 # PyTorch >= 2.6 defaults torch.load(..., weights_only=True), which breaks legacy YOLOv7 checkpoints.
 _ORIG_TORCH_LOAD = torch.load
@@ -305,6 +306,8 @@ def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor
     except Exception as exc:
         return frame, f"Loi khoi tao model: {exc}"
 
+    frame = downscale_frame(frame, MAX_FRAME_EDGE)
+
     return engine.infer(
         frame_rgb=frame,
         conf_thres=float(conf_thres),
@@ -320,30 +323,51 @@ DESCRIPTION = (
     "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt."
 )
 
-demo = gr.Interface(
-    fn=process_frame,
-    inputs=[
-        gr.Image(
-            label="Webcam",
-            type="numpy",
-            sources=["webcam"],
-            streaming=True,
-        ),
-        gr.Slider(0.10, 0.90, value=0.35, step=0.01, label="Confidence threshold"),
-        gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold"),
-        gr.Slider(320, 640, value=384, step=32, label="Inference image size"),
-        gr.Slider(1, 100, value=20, step=1, label="Max detections"),
-        gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing"),
-    ],
-    outputs=[
-        gr.Image(label="Result", type="numpy"),
-        gr.Textbox(label="Runtime stats"),
-    ],
-    title="YOLOER V2 - Realtime Distance Estimation on CPU",
-    description=DESCRIPTION,
-    live=True,
-    flagging_mode="never",
-)
+def downscale_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
+    if frame is None:
+        return frame
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_edge:
+        return frame
+    scale = max_edge / float(longest)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
+    gr.Markdown("## YOLOER V2 - Realtime Distance Estimation on CPU")
+    gr.Markdown(DESCRIPTION)
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            webcam = gr.Image(
+                label="Webcam",
+                type="numpy",
+                sources=["webcam"],
+                streaming=True,
+                height=360,
+            )
+            conf_slider = gr.Slider(0.10, 0.90, value=0.40, step=0.01, label="Confidence threshold")
+            iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
+            size_slider = gr.Slider(224, 512, value=320, step=32, label="Inference image size")
+            max_det_slider = gr.Slider(1, 60, value=12, step=1, label="Max detections")
+            smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
+        with gr.Column(scale=1):
+            result = gr.Image(label="Result", type="numpy", height=360)
+            stats = gr.Textbox(label="Runtime stats")
+
+    webcam.stream(
+        process_frame,
+        inputs=[webcam, conf_slider, iou_slider, size_slider, max_det_slider, smooth_slider],
+        outputs=[result, stats],
+        show_progress="hidden",
+        queue=False,
+        trigger_mode="always_last",
+        concurrency_limit=1,
+        stream_every=0.05,
+    )
 
 
 if __name__ == "__main__":
