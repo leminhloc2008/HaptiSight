@@ -639,6 +639,54 @@ def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor
     return out_frame, out_stats, session_worker
 
 
+PROFILE_PRESETS = {
+    "Realtime": {
+        "conf": 0.50,
+        "iou": 0.45,
+        "img_size": 192,
+        "max_det": 6,
+        "smooth": 0.45,
+        "depth_enabled": False,
+        "depth_alpha": 0.12,
+        "depth_interval": 7,
+    },
+    "Balanced": {
+        "conf": 0.45,
+        "iou": 0.45,
+        "img_size": 224,
+        "max_det": 8,
+        "smooth": 0.55,
+        "depth_enabled": True,
+        "depth_alpha": 0.18,
+        "depth_interval": 5,
+    },
+    "Precision": {
+        "conf": 0.35,
+        "iou": 0.50,
+        "img_size": 288,
+        "max_det": 14,
+        "smooth": 0.65,
+        "depth_enabled": True,
+        "depth_alpha": 0.22,
+        "depth_interval": 3,
+    },
+}
+
+
+def apply_profile(profile_name: str):
+    p = PROFILE_PRESETS.get(profile_name, PROFILE_PRESETS["Balanced"])
+    return (
+        p["conf"],
+        p["iou"],
+        p["img_size"],
+        p["max_det"],
+        p["smooth"],
+        p["depth_enabled"],
+        p["depth_alpha"],
+        p["depth_interval"],
+    )
+
+
 DESCRIPTION = (
     "YOLOER V2 tren Hugging Face Spaces (CPU realtime webcam). "
     "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt. "
@@ -664,6 +712,11 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
 
     with gr.Row():
         with gr.Column(scale=1):
+            profile = gr.Dropdown(
+                choices=["Realtime", "Balanced", "Precision"],
+                value="Balanced",
+                label="Performance profile",
+            )
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
@@ -677,13 +730,28 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             size_slider = gr.Slider(192, 512, value=224, step=32, label="Inference image size")
             max_det_slider = gr.Slider(1, 60, value=8, step=1, label="Max detections")
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
-            depth_enabled = gr.Checkbox(value=False, label="Enable MiDaS v2.1 Small depth")
-            depth_alpha = gr.Slider(0.0, 0.7, value=0.22, step=0.01, label="Depth overlay alpha")
+            depth_enabled = gr.Checkbox(value=True, label="Enable MiDaS v2.1 Small depth")
+            depth_alpha = gr.Slider(0.0, 0.7, value=0.18, step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 8, value=5, step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
     session_worker = gr.State(value=None)
+
+    profile.change(
+        apply_profile,
+        inputs=[profile],
+        outputs=[
+            conf_slider,
+            iou_slider,
+            size_slider,
+            max_det_slider,
+            smooth_slider,
+            depth_enabled,
+            depth_alpha,
+            depth_interval,
+        ],
+    )
 
     stream_kwargs = {
         "show_progress": "hidden",
