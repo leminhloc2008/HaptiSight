@@ -8,7 +8,7 @@ pinned: false
 ---
 
 # YOLOER_V2
-YOLOER stands for You Only Look Once and Estimate Range while V1 implies the version of object detector (V2 = YOLOv7). The project is about REAL-TIME Object Detection and Distance/Depth Estimation using YOLOv7 object detector. To test the Real-Time functionality immediately, we provide the option of running the model on the webcam. Moreover, the options of testing on recorded videos and images are also provided.
+YOLOER stands for You Only Look Once and Estimate Range. This Space version uses **YOLOE (THU-MIG)** for object detection, combined with MiDaS depth and 3D coordinate estimation for realtime CPU webcam inference.
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HassanBinHaroon/YOLOER_V2/blob/master/YOLOER_V2.ipynb)
 
@@ -16,12 +16,11 @@ YOLOER stands for You Only Look Once and Estimate Range while V1 implies the ver
 
 This repo now includes a Spaces-ready Gradio app at `app.py`.
 
-### 1) Recommended weights for CPU realtime
+### 1) Recommended detector for CPU realtime
 
-- Best: `REAL-TIME_Distance_Estimation_with_YOLOV7/yolov7-tiny.pt`
-- Fallback: `REAL-TIME_Distance_Estimation_with_YOLOV7/yolov7.pt`
-
-The app auto-selects `yolov7-tiny.pt` first for better FPS on CPU.
+- Default: `YOLOE_MODEL_ID=yoloe-11s`
+- Fallback: `yoloe-v8s`
+- Custom checkpoint: set `YOLOE_WEIGHTS` to a local `.pt` path or URL.
 
 ### 2) Space settings
 
@@ -32,7 +31,8 @@ The app auto-selects `yolov7-tiny.pt` first for better FPS on CPU.
 
 Optional environment variables:
 
-- `YOLO_WEIGHTS`: custom weights path (absolute or relative)
+- `YOLOE_MODEL_ID`: model id, e.g. `yoloe-11s`, `yoloe-v8s`, `yoloe-v8m`
+- `YOLOE_WEIGHTS`: custom YOLOE `.pt` path (absolute or relative) or URL
 - `CPU_THREADS`: number of CPU threads for Torch (default: `2`)
 - `GEMINI_API_KEY`: key for Gemini smart multi-agent planner (optional)
 - `CAM_FOV_DEG`: camera horizontal FOV for XYZ projection (default: `70`)

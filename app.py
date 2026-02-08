@@ -1,11 +1,10 @@
 import os
-import sys
 import inspect
 import threading
 import time
 import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Optional
 
 import cv2
 import gradio as gr
@@ -14,6 +13,8 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
+from ultralytics import YOLOE
 
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
@@ -22,58 +23,7 @@ MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
 MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "288"))
 CAM_FOV_DEG = float(os.getenv("CAM_FOV_DEG", "70.0"))
 
-# PyTorch >= 2.6 defaults torch.load(..., weights_only=True), which breaks legacy YOLOv7 checkpoints.
-_ORIG_TORCH_LOAD = torch.load
-
-
-def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _ORIG_TORCH_LOAD(*args, **kwargs)
-
-
-torch.load = _torch_load_compat
-
-if str(YOLO_DIR) not in sys.path:
-    sys.path.insert(0, str(YOLO_DIR))
-
-from models.experimental import attempt_load  # noqa: E402
-from utils.general import check_img_size, non_max_suppression, scale_coords  # noqa: E402
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
-
-
-def letterbox(img, new_shape=640, color=(114, 114, 114), auto=False, scale_fill=False, scaleup=True, stride=32):
-    shape = img.shape[:2]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
-
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    if not scaleup:
-        r = min(r, 1.0)
-
-    ratio = (r, r)
-    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
-    dw = new_shape[1] - new_unpad[0]
-    dh = new_shape[0] - new_unpad[1]
-
-    if auto:
-        dw, dh = np.mod(dw, stride), np.mod(dh, stride)
-    elif scale_fill:
-        dw, dh = 0.0, 0.0
-        new_unpad = (new_shape[1], new_shape[0])
-        ratio = (new_shape[1] / shape[1], new_shape[0] / shape[0])
-
-    dw /= 2
-    dh /= 2
-
-    if shape[::-1] != new_unpad:
-        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-
-    top = int(round(dh - 0.1))
-    bottom = int(round(dh + 0.1))
-    left = int(round(dw - 0.1))
-    right = int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return img, ratio, (dw, dh)
 
 
 class DistanceMLP:
@@ -150,16 +100,9 @@ class MidasDepthEstimator:
 class RealtimeEngine:
     ORIG_HEIGHT = 375.0
     ORIG_WIDTH = 1242.0
-    WEIGHTS_URLS = {
-        "yolov7-tiny.pt": [
-            "https://huggingface.co/akhaliq/yolov7/resolve/main/yolov7-tiny.pt",
-            "https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-tiny.pt",
-        ],
-        "yolov7.pt": [
-            "https://huggingface.co/akhaliq/yolov7/resolve/main/yolov7.pt",
-            "https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7.pt",
-        ],
-    }
+    YOLOE_REPO_ID = "jameslahm/yoloe"
+    DEFAULT_MODEL_ID = "yoloe-11s"
+    FALLBACK_MODEL_ID = "yoloe-v8s"
 
     def __init__(self):
         requested_threads = int(os.getenv("CPU_THREADS", "2"))
@@ -170,15 +113,18 @@ class RealtimeEngine:
         except RuntimeError:
             pass
 
-        self.device = torch.device("cpu")
+        self.torch_device = torch.device("cpu")
+        self.device = "cpu"
         self.weights_path = self._resolve_weights_path()
+        self.detector_label = Path(self.weights_path).name
         self.distance_model = DistanceMLP(YOLO_DIR / "model@1535470106.h5")
-        self.model = attempt_load(str(self.weights_path), map_location=self.device)
-        self.model.eval()
-        self.stride = int(self.model.stride.max())
-        self.names = self.model.module.names if hasattr(self.model, "module") else self.model.names
-        rng = np.random.default_rng(7)
-        self.colors = rng.integers(0, 255, size=(len(self.names), 3), dtype=np.uint8)
+        self.model: Optional[YOLOE] = None
+        self.base_names: Dict[int, str] = {}
+        self.names: Dict[int, str] = {}
+        self.active_prompt_classes: Optional[Tuple[str, ...]] = None
+        self.active_prompt_error: Optional[str] = None
+        self.color_cache: Dict[str, Tuple[int, int, int]] = {}
+        self._load_detector()
         self.distance_cache: Dict[str, float] = {}
         self.xyz_cache: Dict[str, Tuple[float, float, float]] = {}
         self.xyz_filter_state: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
@@ -187,33 +133,52 @@ class RealtimeEngine:
         self.depth_last_latency_ms = 0.0
         self.depth_frame_counter = 0
 
-    def _resolve_weights_path(self) -> Path:
-        env_weight = os.getenv("YOLO_WEIGHTS", "").strip()
+    @staticmethod
+    def _model_filename(model_id: str) -> str:
+        name = (model_id or "").strip()
+        if not name:
+            name = RealtimeEngine.DEFAULT_MODEL_ID
+        if name.endswith(".pt"):
+            return Path(name).name
+        if name.endswith("-seg"):
+            return f"{name}.pt"
+        return f"{name}-seg.pt"
+
+    def _resolve_weights_path(self) -> str:
+        env_weight = os.getenv("YOLOE_WEIGHTS", "").strip()
         candidates = []
         if env_weight:
+            if env_weight.lower().startswith(("http://", "https://")):
+                target = ROOT / Path(env_weight).name
+                self._download_file(env_weight, target)
+                return str(target)
             env_path = Path(env_weight)
             candidates.extend([env_path, ROOT / env_path, YOLO_DIR / env_path])
-        candidates.extend([ROOT / "yolov7-tiny.pt", ROOT / "yolov7.pt", YOLO_DIR / "yolov7-tiny.pt", YOLO_DIR / "yolov7.pt"])
-
         for path in candidates:
             if path.is_file():
-                return path
+                return str(path)
 
-        if env_weight.lower().startswith(("http://", "https://")):
-            target = ROOT / Path(env_weight).name
-            self._download_file(env_weight, target)
-            return target
-
-        weight_name = Path(env_weight).name if env_weight else "yolov7-tiny.pt"
-        if weight_name not in self.WEIGHTS_URLS:
+        if env_weight:
             raise FileNotFoundError(
-                f"Khong tim thay weights local cho '{weight_name}'. "
-                "Dat YOLO_WEIGHTS la duong dan ton tai hoac URL hop le."
+                f"Khong tim thay weights local cho '{env_weight}'. "
+                "Dat YOLOE_WEIGHTS la duong dan ton tai hoac URL hop le."
             )
 
-        target = ROOT / weight_name
-        self._download_from_mirrors(weight_name, target)
-        return target
+        requested_model = os.getenv("YOLOE_MODEL_ID", self.DEFAULT_MODEL_ID).strip() or self.DEFAULT_MODEL_ID
+        requested_file = self._model_filename(requested_model)
+        try:
+            return hf_hub_download(repo_id=self.YOLOE_REPO_ID, filename=requested_file)
+        except Exception as exc:
+            fallback_file = self._model_filename(self.FALLBACK_MODEL_ID)
+            if requested_file == fallback_file:
+                raise RuntimeError(f"Khong tai duoc YOLOE checkpoint '{requested_file}': {exc}") from exc
+            try:
+                return hf_hub_download(repo_id=self.YOLOE_REPO_ID, filename=fallback_file)
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Khong tai duoc YOLOE checkpoint '{requested_file}' va fallback '{fallback_file}'. "
+                    f"Chi tiet: {exc} | {fallback_exc}"
+                ) from fallback_exc
 
     def _download_file(self, url: str, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -229,16 +194,72 @@ class RealtimeEngine:
             raise RuntimeError(f"Downloaded file qua nho tu {url}")
         tmp.replace(target)
 
-    def _download_from_mirrors(self, weight_name: str, target: Path) -> None:
-        errors = []
-        for url in self.WEIGHTS_URLS.get(weight_name, []):
-            try:
-                self._download_file(url, target)
-                return
-            except Exception as exc:
-                errors.append(f"{url} -> {exc}")
-        joined = "\n".join(errors) if errors else "Khong co mirror URL"
-        raise RuntimeError(f"Khong the tai weights {weight_name}. Chi tiet:\n{joined}")
+    @staticmethod
+    def _names_to_dict(names_obj) -> Dict[int, str]:
+        if isinstance(names_obj, dict):
+            return {int(k): str(v) for k, v in names_obj.items()}
+        if isinstance(names_obj, (list, tuple)):
+            return {i: str(v) for i, v in enumerate(names_obj)}
+        return {}
+
+    def _load_detector(self) -> None:
+        self.model = YOLOE(self.weights_path)
+        self.model.to(self.device)
+        self.model.eval()
+        self.base_names = self._names_to_dict(getattr(self.model, "names", None))
+        self.names = dict(self.base_names)
+        self.active_prompt_classes = None
+        self.active_prompt_error = None
+
+    @staticmethod
+    def _parse_prompt_classes(class_prompt: str) -> List[str]:
+        raw = (class_prompt or "").replace("\n", ",").replace(";", ",")
+        items = [x.strip() for x in raw.split(",") if x and x.strip()]
+        unique = []
+        seen = set()
+        for item in items:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
+
+    def _apply_prompt_classes_if_needed(self, class_prompt: str) -> Optional[str]:
+        classes = self._parse_prompt_classes(class_prompt)
+        if not classes:
+            if self.active_prompt_classes is not None:
+                self._load_detector()
+            return None
+
+        cls_tuple = tuple(classes)
+        if self.active_prompt_classes == cls_tuple:
+            return self.active_prompt_error
+
+        assert self.model is not None
+        try:
+            embeddings = self.model.get_text_pe(classes)
+            self.model.set_classes(classes, embeddings)
+            self.names = self._names_to_dict(getattr(self.model, "names", classes))
+            self.active_prompt_classes = cls_tuple
+            self.active_prompt_error = None
+        except Exception as exc:
+            self.active_prompt_classes = cls_tuple
+            self.active_prompt_error = f"Khong set duoc YOLOE prompt classes: {exc}"
+        return self.active_prompt_error
+
+    def _class_name(self, cls_id: int) -> str:
+        return self.names.get(int(cls_id), str(int(cls_id)))
+
+    def _color_for_name(self, name: str) -> Tuple[int, int, int]:
+        color = self.color_cache.get(name)
+        if color is not None:
+            return color
+        seed = sum(ord(c) for c in name) % (2**32)
+        rng = np.random.default_rng(seed)
+        color = tuple(int(v) for v in rng.integers(40, 255, size=3))
+        self.color_cache[name] = color
+        return color
 
     def _predict_distances(self, features: np.ndarray) -> np.ndarray:
         if features.size == 0:
@@ -286,7 +307,7 @@ class RealtimeEngine:
             return self.depth_last_map, None
 
         if self.depth_estimator is None:
-            self.depth_estimator = MidasDepthEstimator(self.device)
+            self.depth_estimator = MidasDepthEstimator(self.torch_device)
 
         t0 = time.perf_counter()
         depth_map = self.depth_estimator.predict(frame_rgb, MAX_DEPTH_EDGE)
@@ -357,12 +378,16 @@ class RealtimeEngine:
         depth_enabled: bool,
         depth_alpha: float,
         depth_interval: int,
+        class_prompt: str,
     ) -> Tuple[np.ndarray, str, Dict[str, object]]:
         start = time.perf_counter()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
         infer_frame_bgr = frame_bgr.copy()
         img_h, img_w = frame_bgr.shape[:2]
-        img_size = check_img_size(int(img_size), s=self.stride)
+        img_size = int(np.clip(int(img_size), 128, 640))
+        img_size = max(128, (img_size // 32) * 32)
+
+        prompt_error = self._apply_prompt_classes_if_needed(class_prompt)
 
         depth_map = None
         depth_error = None
@@ -379,33 +404,46 @@ class RealtimeEngine:
             alpha = float(np.clip(depth_alpha, 0.0, 0.8))
             frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
 
-        padded = letterbox(infer_frame_bgr, new_shape=img_size, stride=self.stride, auto=False)[0]
-        padded = padded[:, :, ::-1].transpose(2, 0, 1)
-        padded = np.ascontiguousarray(padded)
-
-        tensor = torch.from_numpy(padded).to(self.device).float() / 255.0
-        tensor = tensor.unsqueeze(0)
-
         with torch.inference_mode():
-            pred = self.model(tensor, augment=False)[0]
-            det = non_max_suppression(pred, conf_thres, iou_thres, classes=None, agnostic=False)[0]
+            assert self.model is not None
+            results = self.model.predict(
+                source=infer_frame_bgr,
+                imgsz=img_size,
+                conf=float(conf_thres),
+                iou=float(iou_thres),
+                max_det=int(max_det),
+                device=self.device,
+                verbose=False,
+            )
+        pred = results[0] if results else None
+        boxes = pred.boxes if pred is not None else None
 
         nearest_info = None
         fusion_w_mean = None
         scene_objects = []
-        if len(det):
-            det = det.clone()
-            det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], frame_bgr.shape).round()
-            det = det[: int(max_det)]
+        if boxes is not None and len(boxes) > 0:
+            xyxy_np = boxes.xyxy.detach().cpu().numpy()
+            conf_np = boxes.conf.detach().cpu().numpy()
+            cls_np = boxes.cls.detach().cpu().numpy().astype(np.int32)
+
+            names_obj = getattr(pred, "names", None)
+            names_map = self._names_to_dict(names_obj)
+            if names_map:
+                self.names = names_map
 
             features = []
             parsed = []
-            for *xyxy, conf, cls in det:
-                x1, y1, x2, y2 = [int(v.item()) for v in xyxy]
+            for idx in range(len(xyxy_np)):
+                x1, y1, x2, y2 = [int(v) for v in xyxy_np[idx]]
                 x1 = int(np.clip(x1, 0, img_w - 1))
                 y1 = int(np.clip(y1, 0, img_h - 1))
                 x2 = int(np.clip(x2, 0, img_w - 1))
                 y2 = int(np.clip(y2, 0, img_h - 1))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                conf = float(conf_np[idx])
+                cls_id = int(cls_np[idx])
+                name = self._class_name(cls_id)
 
                 scaled_x1 = (x1 / img_w) * self.ORIG_WIDTH
                 scaled_x2 = (x2 / img_w) * self.ORIG_WIDTH
@@ -413,20 +451,44 @@ class RealtimeEngine:
                 scaled_y2 = (y2 / img_h) * self.ORIG_HEIGHT
 
                 features.append([scaled_x1, scaled_y1, scaled_x2, scaled_y2])
-                parsed.append((x1, y1, x2, y2, float(conf.item()), int(cls.item())))
+                parsed.append((x1, y1, x2, y2, conf, cls_id, name))
+
+            if not parsed:
+                self.distance_cache = {}
+                self.xyz_cache = {}
+                self.xyz_filter_state = {}
+                object_count = 0
+                latency_ms = (time.perf_counter() - start) * 1000.0
+                fps = 1000.0 / max(latency_ms, 1e-6)
+                stats = f"detector={self.detector_label} | objects=0 | latency={latency_ms:.1f}ms | fps~{fps:.1f}"
+                result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
+                scene_state = {
+                    "timestamp": time.time(),
+                    "image_size": [int(img_w), int(img_h)],
+                    "profile_fov_deg": CAM_FOV_DEG,
+                    "objects": [],
+                    "nearest": None,
+                    "depth_enabled": bool(depth_enabled),
+                    "prompt_classes": list(self.active_prompt_classes) if self.active_prompt_classes else [],
+                }
+                if prompt_error:
+                    stats += f" | prompt_err={prompt_error}"
+                if depth_enabled and depth_error:
+                    stats += f" | depth_err={depth_error}"
+                return result_rgb, stats, scene_state
 
             distance_values = self._predict_distances(np.asarray(features, dtype=np.float32))
             conf_vals_np = np.asarray([p[4] for p in parsed], dtype=np.float32)
             area_vals_np = np.asarray([max(1.0, float((p[2] - p[0]) * (p[3] - p[1]))) for p in parsed], dtype=np.float32)
             depth_vals = None
-            depth_metric_vals = None
             fusion_w_vals = None
             if depth_map is not None:
                 depth_vals = np.asarray(
                     [self._sample_box_depth(depth_map, p[0], p[1], p[2], p[3]) for p in parsed],
                     dtype=np.float32,
                 )
-                distance_values, depth_metric_vals, fusion_w_vals = self._fuse_distance_with_depth(
+                distance_values, _, fusion_w_vals = self._fuse_distance_with_depth(
                     distance_values,
                     depth_vals,
                     conf_vals_np,
@@ -445,8 +507,8 @@ class RealtimeEngine:
             new_xyz_cache: Dict[str, Tuple[float, float, float]] = {}
             now_ts = time.perf_counter()
 
-            for idx, (x1, y1, x2, y2, conf, cls_id) in enumerate(parsed):
-                key = f"{cls_id}:{(x1 + x2) // 80}:{(y1 + y2) // 80}"
+            for idx, (x1, y1, x2, y2, conf, cls_id, name) in enumerate(parsed):
+                key = f"{name}:{(x1 + x2) // 80}:{(y1 + y2) // 80}"
                 raw_dist = float(distance_values[idx])
                 prev_dist = self.distance_cache.get(key, raw_dist)
                 smoothed = smooth_factor * prev_dist + (1.0 - smooth_factor) * raw_dist
@@ -462,7 +524,7 @@ class RealtimeEngine:
                 d3 = float(np.sqrt(x3 * x3 + y3 * y3 + z * z))
 
                 obj = {
-                    "name": self.names[cls_id],
+                    "name": name,
                     "conf": conf,
                     "x": x3,
                     "y": y3,
@@ -471,7 +533,7 @@ class RealtimeEngine:
                 }
                 scene_objects.append(
                     {
-                        "name": self.names[cls_id],
+                        "name": name,
                         "conf": round(float(conf), 4),
                         "bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
                         "distance_m": round(float(smoothed), 3),
@@ -487,10 +549,10 @@ class RealtimeEngine:
                 if depth_map is not None:
                     depth_val = float(depth_vals[idx]) if depth_vals is not None else -1.0
                     fusion_w = float(fusion_w_vals[idx]) if fusion_w_vals is not None else 0.0
-                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f} z{depth_val:.2f} w{fusion_w:.2f}"
+                    label = f"{name} {smoothed:.1f}m d{d3:.1f} z{depth_val:.2f} w{fusion_w:.2f}"
                 else:
-                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f}"
-                color = tuple(int(c) for c in self.colors[cls_id])
+                    label = f"{name} {smoothed:.1f}m d{d3:.1f}"
+                color = self._color_for_name(name)
                 self._draw_box(frame_bgr, x1, y1, x2, y2, label, color)
 
             self.distance_cache = new_cache
@@ -506,9 +568,13 @@ class RealtimeEngine:
         latency_ms = (time.perf_counter() - start) * 1000.0
         fps = 1000.0 / max(latency_ms, 1e-6)
         stats = (
-            f"weights={self.weights_path.name} | objects={object_count} | "
+            f"detector={self.detector_label} | objects={object_count} | "
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
+        if self.active_prompt_classes:
+            stats += f" | prompt_cls={len(self.active_prompt_classes)}"
+        if prompt_error:
+            stats += f" | prompt_err={prompt_error}"
         if nearest_info is not None:
             direction_h = "center"
             if nearest_info["x"] < -0.25:
@@ -537,6 +603,7 @@ class RealtimeEngine:
             "objects": scene_objects,
             "nearest": nearest_info,
             "depth_enabled": bool(depth_enabled),
+            "prompt_classes": list(self.active_prompt_classes) if self.active_prompt_classes else [],
         }
         return result_rgb, stats, scene_state
 
@@ -577,7 +644,19 @@ class AsyncInferenceWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, depth_enabled, depth_alpha, depth_interval):
+    def submit(
+        self,
+        frame,
+        conf_thres,
+        iou_thres,
+        img_size,
+        max_det,
+        smooth_factor,
+        depth_enabled,
+        depth_alpha,
+        depth_interval,
+        class_prompt,
+    ):
         frame = downscale_frame(frame, MAX_FRAME_EDGE)
         params = (
             float(conf_thres),
@@ -588,15 +667,19 @@ class AsyncInferenceWorker:
             bool(depth_enabled),
             float(depth_alpha),
             int(depth_interval),
+            str(class_prompt or ""),
         )
         with self._lock:
+            busy_before_submit = self._done_seq < self._pending_seq
             self._pending_frame = frame
             self._pending_params = params
             self._pending_seq += 1
             latest_frame = self._latest_frame
             latest_stats = self._latest_stats
 
-        # Return immediately: no blocking on model inference in request path.
+        # Return immediately: never block request path on model inference.
+        if busy_before_submit:
+            return frame, f"{latest_stats} | live_preview=1"
         if latest_frame is None:
             return frame, latest_stats
         return latest_frame, latest_stats
@@ -648,7 +731,19 @@ class AsyncInferenceWorker:
                     self._latest_scene = scene_state
 
 
-def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor, depth_enabled, depth_alpha, depth_interval, session_worker):
+def process_frame(
+    frame,
+    conf_thres,
+    iou_thres,
+    img_size,
+    max_det,
+    smooth_factor,
+    depth_enabled,
+    depth_alpha,
+    depth_interval,
+    class_prompt,
+    session_worker,
+):
     if frame is None:
         return None, "Dang cho frame webcam...", session_worker
 
@@ -665,6 +760,7 @@ def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor
         depth_enabled,
         depth_alpha,
         depth_interval,
+        class_prompt,
     )
     return out_frame, out_stats, session_worker
 
@@ -853,7 +949,8 @@ def run_smart_planner(user_query: str, profile_name: str, api_key_input: str, se
 
 DESCRIPTION = (
     "YOLOER V2 tren Hugging Face Spaces (CPU realtime webcam). "
-    "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt. "
+    "Object detection da chuyen sang YOLOE (THU-MIG) de tang do chinh xac. "
+    "Co the nhap prompt classes de tap trung vao nhom vat the muc tieu. "
     "Co the bat MiDaS v2.1 Small de phan tich depth va toa do 3D theo thoi gian thuc."
 )
 
@@ -904,6 +1001,12 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             size_slider = gr.Slider(192, 512, value=224, step=32, label="Inference image size")
             max_det_slider = gr.Slider(1, 60, value=8, step=1, label="Max detections")
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
+            class_prompt = gr.Textbox(
+                label="YOLOE prompt classes (optional, comma-separated)",
+                value="",
+                lines=2,
+                placeholder="cup, bottle, apple, cell phone",
+            )
             depth_enabled = gr.Checkbox(value=True, label="Enable MiDaS v2.1 Small depth")
             depth_alpha = gr.Slider(0.0, 0.7, value=0.18, step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 8, value=5, step=1, label="Depth update every N frames")
@@ -952,6 +1055,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             depth_enabled,
             depth_alpha,
             depth_interval,
+            class_prompt,
             session_worker,
         ],
         outputs=[result, stats, session_worker],

@@ -1,5 +1,6 @@
 gradio>=5.0.0
 h5py>=3.9.0
+huggingface-hub>=0.26.0
 matplotlib>=3.7.0
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
@@ -13,3 +14,6 @@ torch>=2.1.0
 torchvision>=0.16.0
 timm>=0.9.16
 tqdm>=4.66.0
+git+https://github.com/THU-MIG/yoloe.git#subdirectory=third_party/CLIP
+git+https://github.com/THU-MIG/yoloe.git#subdirectory=third_party/ml-mobileclip
+git+https://github.com/THU-MIG/yoloe.git
