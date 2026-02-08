@@ -179,6 +179,7 @@ class RealtimeEngine:
         self.colors = rng.integers(0, 255, size=(len(self.names), 3), dtype=np.uint8)
         self.distance_cache: Dict[str, float] = {}
         self.xyz_cache: Dict[str, Tuple[float, float, float]] = {}
+        self.xyz_filter_state: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
         self.depth_estimator = None
         self.depth_last_map = None
         self.depth_last_latency_ms = 0.0
@@ -292,21 +293,56 @@ class RealtimeEngine:
         return depth_map, None
 
     @staticmethod
-    def _fuse_distance_with_depth(distance_m: np.ndarray, depth_vals: np.ndarray) -> np.ndarray:
+    def _fuse_distance_with_depth(
+        distance_m: np.ndarray,
+        depth_vals: np.ndarray,
+        conf_vals: np.ndarray,
+        area_vals: np.ndarray,
+        frame_area: float,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if distance_m.size == 0 or depth_vals.size == 0:
-            return distance_m
+            return distance_m, distance_m, np.zeros_like(distance_m, dtype=np.float32)
 
         inv_depth = np.clip(depth_vals.astype(np.float32), 1e-3, None)
         distance_m = np.clip(distance_m.astype(np.float32), 0.05, None)
+        conf_vals = np.clip(conf_vals.astype(np.float32), 0.0, 1.0)
+        area_ratio = np.clip(area_vals.astype(np.float32) / max(frame_area, 1.0), 1e-4, 1.0)
+        area_term = np.sqrt(area_ratio)
 
         # MiDaS is relative inverse depth. Calibrate per-frame scale using YOLOER metric distance.
         scale = np.median(distance_m * inv_depth)
         if not np.isfinite(scale) or scale <= 1e-6:
-            return distance_m
+            return distance_m, distance_m, np.zeros_like(distance_m, dtype=np.float32)
 
         depth_metric = scale / inv_depth
-        fused = 0.72 * distance_m + 0.28 * depth_metric
-        return np.clip(fused, 0.05, None)
+        rel_err = np.abs(depth_metric - distance_m) / np.maximum(distance_m, 0.25)
+        consistency = np.exp(-1.8 * rel_err).astype(np.float32)
+
+        # Adaptive fusion: trust MiDaS more when detector confidence is lower or object is small/far.
+        w_midas = 0.18 + 0.30 * (1.0 - conf_vals) + 0.14 * (1.0 - area_term)
+        w_midas = np.clip(w_midas * consistency, 0.05, 0.58)
+
+        fused = (1.0 - w_midas) * distance_m + w_midas * depth_metric
+        return np.clip(fused, 0.05, None), depth_metric, w_midas
+
+    def _update_xyz_filter(self, key: str, measurement_xyz: Tuple[float, float, float], conf: float, now_ts: float):
+        meas = np.asarray(measurement_xyz, dtype=np.float32)
+        state = self.xyz_filter_state.get(key)
+        if state is None:
+            self.xyz_filter_state[key] = (meas, np.zeros(3, dtype=np.float32), now_ts)
+            return float(meas[0]), float(meas[1]), float(meas[2])
+
+        pos, vel, last_ts = state
+        dt = float(np.clip(now_ts - last_ts, 1e-3, 0.2))
+        pred = pos + vel * dt
+        residual = meas - pred
+        conf = float(np.clip(conf, 0.0, 1.0))
+        alpha = 0.30 + 0.45 * conf
+        beta = 0.03 + 0.08 * conf
+        pos_new = pred + alpha * residual
+        vel_new = vel + (beta / dt) * residual
+        self.xyz_filter_state[key] = (pos_new, vel_new, now_ts)
+        return float(pos_new[0]), float(pos_new[1]), float(pos_new[2])
 
     def infer(
         self,
@@ -353,6 +389,7 @@ class RealtimeEngine:
             det = non_max_suppression(pred, conf_thres, iou_thres, classes=None, agnostic=False)[0]
 
         nearest_info = None
+        fusion_w_mean = None
         if len(det):
             det = det.clone()
             det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], frame_bgr.shape).round()
@@ -376,13 +413,25 @@ class RealtimeEngine:
                 parsed.append((x1, y1, x2, y2, float(conf.item()), int(cls.item())))
 
             distance_values = self._predict_distances(np.asarray(features, dtype=np.float32))
+            conf_vals_np = np.asarray([p[4] for p in parsed], dtype=np.float32)
+            area_vals_np = np.asarray([max(1.0, float((p[2] - p[0]) * (p[3] - p[1]))) for p in parsed], dtype=np.float32)
             depth_vals = None
+            depth_metric_vals = None
+            fusion_w_vals = None
             if depth_map is not None:
                 depth_vals = np.asarray(
                     [self._sample_box_depth(depth_map, p[0], p[1], p[2], p[3]) for p in parsed],
                     dtype=np.float32,
                 )
-                distance_values = self._fuse_distance_with_depth(distance_values, depth_vals)
+                distance_values, depth_metric_vals, fusion_w_vals = self._fuse_distance_with_depth(
+                    distance_values,
+                    depth_vals,
+                    conf_vals_np,
+                    area_vals_np,
+                    float(img_w * img_h),
+                )
+                if fusion_w_vals is not None and fusion_w_vals.size:
+                    fusion_w_mean = float(np.mean(fusion_w_vals))
 
             fx = (img_w * 0.5) / max(np.tan(np.deg2rad(CAM_FOV_DEG * 0.5)), 1e-3)
             fy = fx
@@ -391,6 +440,7 @@ class RealtimeEngine:
 
             new_cache: Dict[str, float] = {}
             new_xyz_cache: Dict[str, Tuple[float, float, float]] = {}
+            now_ts = time.perf_counter()
 
             for idx, (x1, y1, x2, y2, conf, cls_id) in enumerate(parsed):
                 key = f"{cls_id}:{(x1 + x2) // 80}:{(y1 + y2) // 80}"
@@ -404,10 +454,7 @@ class RealtimeEngine:
                 z = max(smoothed, 0.05)
                 x3 = ((u - cx) / fx) * z
                 y3 = ((v - cy) / fy) * z
-                prev_xyz = self.xyz_cache.get(key, (x3, y3, z))
-                x3 = smooth_factor * prev_xyz[0] + (1.0 - smooth_factor) * x3
-                y3 = smooth_factor * prev_xyz[1] + (1.0 - smooth_factor) * y3
-                z = smooth_factor * prev_xyz[2] + (1.0 - smooth_factor) * z
+                x3, y3, z = self._update_xyz_filter(key, (x3, y3, z), conf, now_ts)
                 new_xyz_cache[key] = (x3, y3, z)
                 d3 = float(np.sqrt(x3 * x3 + y3 * y3 + z * z))
 
@@ -424,7 +471,8 @@ class RealtimeEngine:
 
                 if depth_map is not None:
                     depth_val = float(depth_vals[idx]) if depth_vals is not None else -1.0
-                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f} z{depth_val:.2f}"
+                    fusion_w = float(fusion_w_vals[idx]) if fusion_w_vals is not None else 0.0
+                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f} z{depth_val:.2f} w{fusion_w:.2f}"
                 else:
                     label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f}"
                 color = tuple(int(c) for c in self.colors[cls_id])
@@ -432,10 +480,12 @@ class RealtimeEngine:
 
             self.distance_cache = new_cache
             self.xyz_cache = new_xyz_cache
+            self.xyz_filter_state = {k: self.xyz_filter_state[k] for k in new_xyz_cache.keys() if k in self.xyz_filter_state}
             object_count = len(parsed)
         else:
             self.distance_cache = {}
             self.xyz_cache = {}
+            self.xyz_filter_state = {}
             object_count = 0
 
         latency_ms = (time.perf_counter() - start) * 1000.0
@@ -445,14 +495,22 @@ class RealtimeEngine:
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
         if nearest_info is not None:
+            direction_h = "center"
+            if nearest_info["x"] < -0.25:
+                direction_h = "left"
+            elif nearest_info["x"] > 0.25:
+                direction_h = "right"
             stats += (
                 f" | nearest={nearest_info['name']} D={nearest_info['d']:.2f}m"
                 f" XYZ=({nearest_info['x']:+.2f},{nearest_info['y']:+.2f},{nearest_info['z']:.2f})"
+                f" dir={direction_h}"
             )
         if depth_enabled:
             stats += f" | depth_every={max(1, int(depth_interval))}"
             if self.depth_last_latency_ms > 0:
                 stats += f" | depth={self.depth_last_latency_ms:.1f}ms"
+            if fusion_w_mean is not None:
+                stats += f" | w_depth={fusion_w_mean:.2f}"
             if depth_error:
                 stats += f" | depth_err={depth_error}"
         result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
