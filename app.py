@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
 MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "512"))
 MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
-MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "384"))
+MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "288"))
+CAM_FOV_DEG = float(os.getenv("CAM_FOV_DEG", "70.0"))
 
 # PyTorch >= 2.6 defaults torch.load(..., weights_only=True), which breaks legacy YOLOv7 checkpoints.
 _ORIG_TORCH_LOAD = torch.load
@@ -177,6 +178,7 @@ class RealtimeEngine:
         rng = np.random.default_rng(7)
         self.colors = rng.integers(0, 255, size=(len(self.names), 3), dtype=np.uint8)
         self.distance_cache: Dict[str, float] = {}
+        self.xyz_cache: Dict[str, Tuple[float, float, float]] = {}
         self.depth_estimator = None
         self.depth_last_map = None
         self.depth_last_latency_ms = 0.0
@@ -289,6 +291,23 @@ class RealtimeEngine:
         self.depth_last_map = depth_map
         return depth_map, None
 
+    @staticmethod
+    def _fuse_distance_with_depth(distance_m: np.ndarray, depth_vals: np.ndarray) -> np.ndarray:
+        if distance_m.size == 0 or depth_vals.size == 0:
+            return distance_m
+
+        inv_depth = np.clip(depth_vals.astype(np.float32), 1e-3, None)
+        distance_m = np.clip(distance_m.astype(np.float32), 0.05, None)
+
+        # MiDaS is relative inverse depth. Calibrate per-frame scale using YOLOER metric distance.
+        scale = np.median(distance_m * inv_depth)
+        if not np.isfinite(scale) or scale <= 1e-6:
+            return distance_m
+
+        depth_metric = scale / inv_depth
+        fused = 0.72 * distance_m + 0.28 * depth_metric
+        return np.clip(fused, 0.05, None)
+
     def infer(
         self,
         frame_rgb: np.ndarray,
@@ -303,6 +322,7 @@ class RealtimeEngine:
     ) -> Tuple[np.ndarray, str]:
         start = time.perf_counter()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        infer_frame_bgr = frame_bgr.copy()
         img_h, img_w = frame_bgr.shape[:2]
         img_size = check_img_size(int(img_size), s=self.stride)
 
@@ -315,7 +335,13 @@ class RealtimeEngine:
                 depth_error = str(exc)
                 depth_map = None
 
-        padded = letterbox(frame_bgr, new_shape=img_size, stride=self.stride, auto=False)[0]
+        if depth_map is not None and depth_alpha > 0:
+            depth_uint8 = (np.clip(depth_map, 0.0, 1.0) * 255.0).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
+            alpha = float(np.clip(depth_alpha, 0.0, 0.8))
+            frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
+
+        padded = letterbox(infer_frame_bgr, new_shape=img_size, stride=self.stride, auto=False)[0]
         padded = padded[:, :, ::-1].transpose(2, 0, 1)
         padded = np.ascontiguousarray(padded)
 
@@ -326,6 +352,7 @@ class RealtimeEngine:
             pred = self.model(tensor, augment=False)[0]
             det = non_max_suppression(pred, conf_thres, iou_thres, classes=None, agnostic=False)[0]
 
+        nearest_info = None
         if len(det):
             det = det.clone()
             det[:, :4] = scale_coords(tensor.shape[2:], det[:, :4], frame_bgr.shape).round()
@@ -349,7 +376,21 @@ class RealtimeEngine:
                 parsed.append((x1, y1, x2, y2, float(conf.item()), int(cls.item())))
 
             distance_values = self._predict_distances(np.asarray(features, dtype=np.float32))
+            depth_vals = None
+            if depth_map is not None:
+                depth_vals = np.asarray(
+                    [self._sample_box_depth(depth_map, p[0], p[1], p[2], p[3]) for p in parsed],
+                    dtype=np.float32,
+                )
+                distance_values = self._fuse_distance_with_depth(distance_values, depth_vals)
+
+            fx = (img_w * 0.5) / max(np.tan(np.deg2rad(CAM_FOV_DEG * 0.5)), 1e-3)
+            fy = fx
+            cx = img_w * 0.5
+            cy = img_h * 0.5
+
             new_cache: Dict[str, float] = {}
+            new_xyz_cache: Dict[str, Tuple[float, float, float]] = {}
 
             for idx, (x1, y1, x2, y2, conf, cls_id) in enumerate(parsed):
                 key = f"{cls_id}:{(x1 + x2) // 80}:{(y1 + y2) // 80}"
@@ -358,25 +399,44 @@ class RealtimeEngine:
                 smoothed = smooth_factor * prev_dist + (1.0 - smooth_factor) * raw_dist
                 new_cache[key] = smoothed
 
+                u = 0.5 * (x1 + x2)
+                v = 0.5 * (y1 + y2)
+                z = max(smoothed, 0.05)
+                x3 = ((u - cx) / fx) * z
+                y3 = ((v - cy) / fy) * z
+                prev_xyz = self.xyz_cache.get(key, (x3, y3, z))
+                x3 = smooth_factor * prev_xyz[0] + (1.0 - smooth_factor) * x3
+                y3 = smooth_factor * prev_xyz[1] + (1.0 - smooth_factor) * y3
+                z = smooth_factor * prev_xyz[2] + (1.0 - smooth_factor) * z
+                new_xyz_cache[key] = (x3, y3, z)
+                d3 = float(np.sqrt(x3 * x3 + y3 * y3 + z * z))
+
+                obj = {
+                    "name": self.names[cls_id],
+                    "conf": conf,
+                    "x": x3,
+                    "y": y3,
+                    "z": z,
+                    "d": d3,
+                }
+                if nearest_info is None or obj["d"] < nearest_info["d"]:
+                    nearest_info = obj
+
                 if depth_map is not None:
-                    depth_val = self._sample_box_depth(depth_map, x1, y1, x2, y2)
-                    label = f"{self.names[cls_id]} {smoothed:.1f}m z{depth_val:.2f} ({conf:.2f})"
+                    depth_val = float(depth_vals[idx]) if depth_vals is not None else -1.0
+                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f} z{depth_val:.2f}"
                 else:
-                    label = f"{self.names[cls_id]} {smoothed:.1f}m ({conf:.2f})"
+                    label = f"{self.names[cls_id]} {smoothed:.1f}m d{d3:.1f}"
                 color = tuple(int(c) for c in self.colors[cls_id])
                 self._draw_box(frame_bgr, x1, y1, x2, y2, label, color)
 
             self.distance_cache = new_cache
+            self.xyz_cache = new_xyz_cache
             object_count = len(parsed)
         else:
             self.distance_cache = {}
+            self.xyz_cache = {}
             object_count = 0
-
-        if depth_map is not None and depth_alpha > 0:
-            depth_uint8 = (np.clip(depth_map, 0.0, 1.0) * 255.0).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
-            alpha = float(np.clip(depth_alpha, 0.0, 0.8))
-            frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
 
         latency_ms = (time.perf_counter() - start) * 1000.0
         fps = 1000.0 / max(latency_ms, 1e-6)
@@ -384,6 +444,11 @@ class RealtimeEngine:
             f"weights={self.weights_path.name} | objects={object_count} | "
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
+        if nearest_info is not None:
+            stats += (
+                f" | nearest={nearest_info['name']} D={nearest_info['d']:.2f}m"
+                f" XYZ=({nearest_info['x']:+.2f},{nearest_info['y']:+.2f},{nearest_info['z']:.2f})"
+            )
         if depth_enabled:
             stats += f" | depth_every={max(1, int(depth_interval))}"
             if self.depth_last_latency_ms > 0:
@@ -518,7 +583,8 @@ def process_frame(frame, conf_thres, iou_thres, img_size, max_det, smooth_factor
 
 DESCRIPTION = (
     "YOLOER V2 tren Hugging Face Spaces (CPU realtime webcam). "
-    "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt."
+    "Mac dinh uu tien yolov7-tiny.pt de tang FPS; neu khong co se dung yolov7.pt. "
+    "Co the bat MiDaS v2.1 Small de phan tich depth va toa do 3D theo thoi gian thuc."
 )
 
 def downscale_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
@@ -555,7 +621,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
             smooth_slider = gr.Slider(0.0, 0.95, value=0.55, step=0.01, label="Distance smoothing")
             depth_enabled = gr.Checkbox(value=False, label="Enable MiDaS v2.1 Small depth")
             depth_alpha = gr.Slider(0.0, 0.7, value=0.22, step=0.01, label="Depth overlay alpha")
-            depth_interval = gr.Slider(1, 6, value=3, step=1, label="Depth update every N frames")
+            depth_interval = gr.Slider(1, 8, value=5, step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
