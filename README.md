@@ -18,6 +18,39 @@ YOLOER stands for You Only Look Once and Estimate Range. This Space version uses
 This repo now includes a Spaces-ready Gradio app at `app.py`.
 The runtime engine uses adaptive detection scheduling (fast frames + periodic hi-res refresh) and asynchronous MiDaS updates to keep webcam output responsive on CPU.
 
+## Modal Deployment (Alternative)
+
+You can deploy the same realtime Gradio app on Modal using `modal_app.py`.
+
+### 1) Install and login
+
+```bash
+pip install -U modal
+modal setup
+```
+
+### 2) Optional warmup (download model/cache once)
+
+```bash
+modal run modal_app.py::warmup
+```
+
+### 3) Deploy web app
+
+```bash
+modal deploy modal_app.py
+```
+
+After deploy, Modal returns a public URL for the ASGI app (`web` function).
+
+### 4) Optional runtime tuning (env)
+
+- `CPU_THREADS` (default `7`)
+- `MAX_FRAME_EDGE` (default `448`)
+- `MAX_DEPTH_EDGE` (default `256`)
+- `HIRES_REFRESH_EVERY` (default `6`)
+- `FAST_SIZE_DELTA` (default `64`)
+
 ### 1) Recommended detector for CPU realtime
 
 - Default: `YOLOE_MODEL_ID=yoloe-11s`
