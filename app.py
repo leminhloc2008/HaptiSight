@@ -917,7 +917,7 @@ def process_frame(
         if latest_frame is not None:
             latest_frame = normalize_frame(latest_frame)
             if latest_frame is not None:
-                return latest_frame, f"{latest_stats} | webcam_decode=retry"
+                return frame_to_html(latest_frame), f"{latest_stats} | webcam_decode=retry"
         placeholder = np.zeros((WEBCAM_CAPTURE_H, WEBCAM_CAPTURE_W, 3), dtype=np.uint8)
         cv2.putText(
             placeholder,
@@ -929,7 +929,7 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
-        return placeholder, "Dang cho frame webcam..."
+        return frame_to_html(placeholder), "Dang cho frame webcam..."
 
     worker = get_worker()
     out_frame, out_stats = worker.submit(
@@ -948,7 +948,7 @@ def process_frame(
         out_frame = normalize_frame(out_frame)
     if out_frame is None:
         out_frame = frame
-    return out_frame, out_stats
+    return frame_to_html(out_frame), out_stats
 
 
 def _build_profile_presets() -> Dict[str, Dict[str, float]]:
@@ -1276,6 +1276,41 @@ def normalize_frame(frame) -> Optional[np.ndarray]:
     return np.ascontiguousarray(arr)
 
 
+def frame_to_imagedata(frame: Optional[np.ndarray], quality: int = 82) -> Dict[str, object]:
+    arr = normalize_frame(frame)
+    if arr is None:
+        arr = np.zeros((max(32, WEBCAM_CAPTURE_H), max(32, WEBCAM_CAPTURE_W), 3), dtype=np.uint8)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    ok, enc = cv2.imencode(
+        ".jpg",
+        bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), int(np.clip(int(quality), 45, 95))],
+    )
+    if not ok:
+        return {"path": None, "url": None, "meta": {"_type": "gradio.FileData"}}
+    b64 = base64.b64encode(enc.tobytes()).decode("ascii")
+    return {
+        "path": None,
+        "url": f"data:image/jpeg;base64,{b64}",
+        "orig_name": "frame.jpg",
+        "mime_type": "image/jpeg",
+        "is_stream": False,
+        "meta": {"_type": "gradio.FileData"},
+    }
+
+
+def frame_to_html(frame: Optional[np.ndarray]) -> str:
+    data = frame_to_imagedata(frame)
+    url = data.get("url")
+    if not isinstance(url, str) or not url:
+        return "<div style='height:300px;background:#111;color:#bbb;display:flex;align-items:center;justify-content:center;'>No frame</div>"
+    return (
+        "<div style='height:300px;background:#111;display:flex;align-items:center;justify-content:center;'>"
+        f"<img src='{url}' style='max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;'/>"
+        "</div>"
+    )
+
+
 with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
     gr.Markdown("## YOLOER V2 - Realtime Distance Estimation")
     gr.Markdown(DESCRIPTION)
@@ -1303,7 +1338,14 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
                 type="numpy",
                 sources=["webcam"],
                 streaming=True,
+                interactive=True,
                 height=300,
+            )
+            cam_perm_btn = gr.Button("Enable Camera Permission")
+            cam_perm_status = gr.Textbox(
+                label="Camera permission status",
+                value="Click button once if webcam does not prompt.",
+                interactive=False,
             )
             conf_slider = gr.Slider(0.10, 0.90, value=_default_profile["conf"], step=0.01, label="Confidence threshold")
             iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
@@ -1320,7 +1362,10 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", height=300)
+            result = gr.HTML(
+                value="<div style='height:300px;background:#111;color:#bbb;display:flex;align-items:center;justify-content:center;'>Waiting for webcam...</div>",
+                label="Result",
+            )
             stats = gr.Textbox(label="Runtime stats")
             plan_btn = gr.Button("Generate Smart Guidance (Gemini)")
             plan_md = gr.Markdown("Guidance plan will appear here.")
@@ -1344,6 +1389,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
     stream_kwargs = {
         "show_progress": "hidden",
         "queue": False,
+        "postprocess": False,
         "trigger_mode": "always_last",
         "concurrency_limit": 1,
         "stream_every": 0.03,
@@ -1367,6 +1413,16 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
         ],
         outputs=[result, stats],
         **stream_kwargs,
+    )
+    cam_perm_btn.click(
+        fn=None,
+        js=(
+            "() => navigator.mediaDevices.getUserMedia({video:true})"
+            ".then((s)=>{s.getTracks().forEach((t)=>t.stop()); return 'Camera permission granted.';})"
+            ".catch((e)=>`Camera permission error: ${e?.message || e}`)"
+        ),
+        outputs=[cam_perm_status],
+        queue=False,
     )
 
     plan_btn.click(
