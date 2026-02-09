@@ -16,6 +16,7 @@ YOLOER stands for You Only Look Once and Estimate Range. This Space version uses
 ## Hugging Face Spaces (CPU Realtime Webcam)
 
 This repo now includes a Spaces-ready Gradio app at `app.py`.
+The runtime engine uses adaptive detection scheduling (fast frames + periodic hi-res refresh) and asynchronous MiDaS updates to keep webcam output responsive on CPU.
 
 ### 1) Recommended detector for CPU realtime
 
@@ -34,7 +35,9 @@ Optional environment variables:
 
 - `YOLOE_MODEL_ID`: model id, e.g. `yoloe-11s`, `yoloe-v8s`, `yoloe-v8m`
 - `YOLOE_WEIGHTS`: custom YOLOE `.pt` path (absolute or relative) or URL
-- `CPU_THREADS`: number of CPU threads for Torch (default: `2`)
+- `CPU_THREADS`: number of CPU threads for Torch (default: auto-tuned)
+- `HIRES_REFRESH_EVERY`: run hi-res detection every N frames (default: `6`)
+- `FAST_SIZE_DELTA`: reduce image size on fast frames (default: `64`)
 - `GEMINI_API_KEY`: key for Gemini smart multi-agent planner (optional)
 - `CAM_FOV_DEG`: camera horizontal FOV for XYZ projection (default: `70`)
 
