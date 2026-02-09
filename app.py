@@ -3,6 +3,7 @@ import inspect
 import threading
 import time
 import json
+import base64
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
@@ -13,6 +14,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLOE
 
@@ -209,7 +211,7 @@ class RealtimeEngine:
     def _model_filename(model_id: str) -> str:
         name = (model_id or "").strip()
         if not name:
-            name = RealtimeEngine.DEFAULT_MODEL_ID
+            name = RealtimeEngine.CPU_DEFAULT_MODEL_ID
         if name.endswith(".pt"):
             return Path(name).name
         if name.endswith("-seg"):
@@ -803,6 +805,9 @@ class AsyncInferenceWorker:
         depth_interval,
         class_prompt,
     ):
+        frame = normalize_frame(frame)
+        if frame is None:
+            return None, "Khong doc duoc frame webcam."
         frame = downscale_frame(frame, MAX_FRAME_EDGE)
         params = (
             float(conf_thres),
@@ -833,6 +838,10 @@ class AsyncInferenceWorker:
     def latest_scene(self):
         with self._lock:
             return self._latest_scene
+
+    def latest_output(self):
+        with self._lock:
+            return self._latest_frame, self._latest_stats
 
     def _run(self):
         engine = None
@@ -865,7 +874,7 @@ class AsyncInferenceWorker:
                 with ENGINE_LOCK:
                     out_frame, stats, scene_state = engine.infer(frame, *params)
             except Exception as exc:
-                out_frame = frame
+                out_frame = normalize_frame(frame)
                 stats = f"Loi infer: {exc}"
                 scene_state = None
 
@@ -890,8 +899,26 @@ def process_frame(
     class_prompt,
     session_worker,
 ):
+    frame = normalize_frame(frame)
     if frame is None:
-        return None, "Dang cho frame webcam...", session_worker
+        if session_worker is not None:
+            latest_frame, latest_stats = session_worker.latest_output()
+            if latest_frame is not None:
+                latest_frame = normalize_frame(latest_frame)
+                if latest_frame is not None:
+                    return latest_frame, f"{latest_stats} | webcam_decode=retry", session_worker
+        placeholder = np.zeros((WEBCAM_CAPTURE_H, WEBCAM_CAPTURE_W, 3), dtype=np.uint8)
+        cv2.putText(
+            placeholder,
+            "Waiting for webcam frame...",
+            (12, max(24, WEBCAM_CAPTURE_H // 2)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (180, 180, 180),
+            2,
+            cv2.LINE_AA,
+        )
+        return placeholder, "Dang cho frame webcam...", session_worker
 
     if session_worker is None:
         session_worker = AsyncInferenceWorker()
@@ -908,6 +935,10 @@ def process_frame(
         depth_interval,
         class_prompt,
     )
+    if out_frame is not None:
+        out_frame = normalize_frame(out_frame)
+    if out_frame is None:
+        out_frame = frame
     return out_frame, out_stats, session_worker
 
 
@@ -1152,6 +1183,91 @@ def downscale_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
     new_w = max(1, int(w * scale))
     new_h = max(1, int(h * scale))
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def normalize_frame(frame) -> Optional[np.ndarray]:
+    if frame is None:
+        return None
+
+    def _extract_payload(obj, depth: int = 0):
+        if obj is None or depth > 6:
+            return None
+        if isinstance(obj, dict):
+            for key in ("image", "composite", "background", "path", "url"):
+                if key in obj and obj.get(key) is not None:
+                    out = _extract_payload(obj.get(key), depth + 1)
+                    if out is not None:
+                        return out
+            return None
+        if isinstance(obj, (list, tuple)):
+            for item in obj:
+                out = _extract_payload(item, depth + 1)
+                if out is not None:
+                    return out
+            return None
+        return obj
+
+    def _from_bytes(blob: bytes) -> Optional[np.ndarray]:
+        arr = np.frombuffer(blob, dtype=np.uint8)
+        if arr.size == 0:
+            return None
+        dec = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if dec is None:
+            return None
+        return cv2.cvtColor(dec, cv2.COLOR_BGR2RGB)
+
+    def _from_string(text: str) -> Optional[np.ndarray]:
+        value = text.strip()
+        if not value:
+            return None
+        if value.startswith("data:image"):
+            try:
+                _, encoded = value.split(",", 1)
+                blob = base64.b64decode(encoded)
+                return _from_bytes(blob)
+            except Exception:
+                return None
+        path = Path(value)
+        if path.is_file():
+            try:
+                with Image.open(path) as img:
+                    return np.asarray(img.convert("RGB"))
+            except Exception:
+                return None
+        return None
+
+    data = _extract_payload(frame)
+    if data is None:
+        return None
+
+    if isinstance(data, bytes):
+        arr = _from_bytes(data)
+        if arr is None:
+            return None
+    elif isinstance(data, str):
+        arr = _from_string(data)
+        if arr is None:
+            return None
+    elif isinstance(data, Image.Image):
+        arr = np.asarray(data.convert("RGB"))
+    else:
+        arr = np.asarray(data)
+
+    if arr.size == 0:
+        return None
+
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2RGB)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        pass
+    else:
+        return None
+
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
 
 
 with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
