@@ -769,6 +769,8 @@ class RealtimeEngine:
 
 ENGINE = None
 ENGINE_LOCK = threading.Lock()
+WORKER = None
+WORKER_LOCK = threading.Lock()
 
 
 def get_engine() -> RealtimeEngine:
@@ -777,6 +779,16 @@ def get_engine() -> RealtimeEngine:
         return ENGINE
     ENGINE = RealtimeEngine()
     return ENGINE
+
+
+def get_worker():
+    global WORKER
+    if WORKER is not None:
+        return WORKER
+    with WORKER_LOCK:
+        if WORKER is None:
+            WORKER = AsyncInferenceWorker()
+    return WORKER
 
 
 class AsyncInferenceWorker:
@@ -897,16 +909,15 @@ def process_frame(
     depth_alpha,
     depth_interval,
     class_prompt,
-    session_worker,
 ):
     frame = normalize_frame(frame)
     if frame is None:
-        if session_worker is not None:
-            latest_frame, latest_stats = session_worker.latest_output()
+        worker = get_worker()
+        latest_frame, latest_stats = worker.latest_output()
+        if latest_frame is not None:
+            latest_frame = normalize_frame(latest_frame)
             if latest_frame is not None:
-                latest_frame = normalize_frame(latest_frame)
-                if latest_frame is not None:
-                    return latest_frame, f"{latest_stats} | webcam_decode=retry", session_worker
+                return latest_frame, f"{latest_stats} | webcam_decode=retry"
         placeholder = np.zeros((WEBCAM_CAPTURE_H, WEBCAM_CAPTURE_W, 3), dtype=np.uint8)
         cv2.putText(
             placeholder,
@@ -918,12 +929,10 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
-        return placeholder, "Dang cho frame webcam...", session_worker
+        return placeholder, "Dang cho frame webcam..."
 
-    if session_worker is None:
-        session_worker = AsyncInferenceWorker()
-
-    out_frame, out_stats = session_worker.submit(
+    worker = get_worker()
+    out_frame, out_stats = worker.submit(
         frame,
         conf_thres,
         iou_thres,
@@ -939,7 +948,7 @@ def process_frame(
         out_frame = normalize_frame(out_frame)
     if out_frame is None:
         out_frame = frame
-    return out_frame, out_stats, session_worker
+    return out_frame, out_stats
 
 
 def _build_profile_presets() -> Dict[str, Dict[str, float]]:
@@ -1130,15 +1139,12 @@ def _render_plan_markdown(plan: Dict[str, object], model_used: str, latency_ms: 
     return "\n".join(lines)
 
 
-def run_smart_planner(user_query: str, profile_name: str, api_key_input: str, session_worker):
-    if session_worker is None:
-        msg = "Chua co scene state. Bat webcam truoc, doi 1-2s roi plan lai."
-        return msg, "{}", session_worker
-
-    scene_state = session_worker.latest_scene()
+def run_smart_planner(user_query: str, profile_name: str, api_key_input: str):
+    worker = get_worker()
+    scene_state = worker.latest_scene()
     if not scene_state:
         msg = "Scene state trong. Hay de webcam chay them mot chut roi bam plan."
-        return msg, "{}", session_worker
+        return msg, "{}"
 
     planner = GeminiMultiAgentPlanner(api_key=api_key_input.strip() if api_key_input else None)
     result = planner.plan(
@@ -1161,7 +1167,7 @@ def run_smart_planner(user_query: str, profile_name: str, api_key_input: str, se
 
     md = _render_plan_markdown(plan, model_used, latency_ms, fallback_used)
     js = json.dumps(plan, ensure_ascii=False, indent=2)
-    return md, js, session_worker
+    return md, js
 
 
 DESCRIPTION = (
@@ -1295,7 +1301,6 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
-                format="jpeg",
                 sources=["webcam"],
                 streaming=True,
                 height=300,
@@ -1315,12 +1320,11 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
+            result = gr.Image(label="Result", type="numpy", height=300)
             stats = gr.Textbox(label="Runtime stats")
             plan_btn = gr.Button("Generate Smart Guidance (Gemini)")
             plan_md = gr.Markdown("Guidance plan will appear here.")
             plan_json = gr.Code(label="Planner JSON", language="json")
-    session_worker = gr.State(value=None)
 
     profile.change(
         apply_profile,
@@ -1360,16 +1364,15 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             depth_alpha,
             depth_interval,
             class_prompt,
-            session_worker,
         ],
-        outputs=[result, stats, session_worker],
+        outputs=[result, stats],
         **stream_kwargs,
     )
 
     plan_btn.click(
         run_smart_planner,
-        inputs=[task_query, profile, gemini_api_key, session_worker],
-        outputs=[plan_md, plan_json, session_worker],
+        inputs=[task_query, profile, gemini_api_key],
+        outputs=[plan_md, plan_json],
         queue=False,
     )
 
