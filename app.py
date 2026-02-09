@@ -28,6 +28,11 @@ WEBCAM_CAPTURE_W = int(os.getenv("WEBCAM_CAPTURE_W", "640"))
 WEBCAM_CAPTURE_H = int(os.getenv("WEBCAM_CAPTURE_H", "360"))
 WEBCAM_CAPTURE_FPS = int(os.getenv("WEBCAM_CAPTURE_FPS", "24"))
 OUTPUT_JPEG_QUALITY = int(os.getenv("OUTPUT_JPEG_QUALITY", "68"))
+PROMPT_CONF_CAP = float(os.getenv("PROMPT_CONF_CAP", "0.02"))
+PROMPT_CONF_RETRY = float(os.getenv("PROMPT_CONF_RETRY", "0.01"))
+PROMPT_IMG_SIZE = int(os.getenv("PROMPT_IMG_SIZE", "640"))
+PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1", "true", "yes"}
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-09-promptfix1")
 
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
 
@@ -157,6 +162,7 @@ class RealtimeEngine:
         self.names: Dict[int, str] = {}
         self.active_prompt_classes: Optional[Tuple[str, ...]] = None
         self.active_prompt_error: Optional[str] = None
+        self.prompt_fp32_active = False
         self.color_cache: Dict[str, Tuple[int, int, int]] = {}
         self._load_detector()
         self.distance_cache: Dict[str, float] = {}
@@ -307,10 +313,16 @@ class RealtimeEngine:
         self.names = dict(self.base_names)
         self.active_prompt_classes = None
         self.active_prompt_error = None
+        self.prompt_fp32_active = False
 
     @staticmethod
     def _parse_prompt_classes(class_prompt: str) -> List[str]:
-        raw = (class_prompt or "").replace("\n", ",").replace(";", ",")
+        raw_input = class_prompt
+        if isinstance(raw_input, dict):
+            raw_input = raw_input.get("value") or raw_input.get("text") or ""
+        elif isinstance(raw_input, (list, tuple)):
+            raw_input = ",".join(str(x) for x in raw_input if x is not None)
+        raw = str(raw_input or "").replace("\n", ",").replace(";", ",")
         items = [x.strip() for x in raw.split(",") if x and x.strip()]
         unique = []
         seen = set()
@@ -330,28 +342,45 @@ class RealtimeEngine:
             return None
 
         cls_tuple = tuple(classes)
-        if self.active_prompt_classes == cls_tuple:
+        if self.active_prompt_classes == cls_tuple and self.active_prompt_error is None:
             return self.active_prompt_error
 
         assert self.model is not None
         try:
+            # YOLOE prompt projection can fail on mixed dtypes in CUDA fp16 mode.
+            # Run prompt setup in fp32 for stability, then infer in fp32 while prompt is active.
+            if self.use_half and self.use_cuda and PROMPT_FORCE_FP32 and hasattr(self.model, "model"):
+                try:
+                    self.model.model.float()
+                    self.prompt_fp32_active = True
+                except Exception:
+                    self.prompt_fp32_active = False
+            else:
+                self.prompt_fp32_active = False
+
             embeddings = self.model.get_text_pe(classes)
             model_dtype = torch.float16 if self.use_half else torch.float32
             try:
                 model_dtype = next(self.model.model.parameters()).dtype  # type: ignore[attr-defined]
             except Exception:
                 pass
+            if self.prompt_fp32_active:
+                model_dtype = torch.float32
             embeddings = embeddings.to(device=self.torch_device, dtype=model_dtype)
             self.model.set_classes(classes, embeddings)
             self.names = self._names_to_dict(getattr(self.model, "names", classes))
             self.active_prompt_classes = cls_tuple
             self.active_prompt_error = None
         except Exception as exc:
+            # Preserve error for UI stats, and allow retry on next calls.
+            err_msg = f"Khong set duoc YOLOE prompt classes: {exc}"
             self.active_prompt_classes = cls_tuple
-            self.active_prompt_error = f"Khong set duoc YOLOE prompt classes: {exc}"
+            self.active_prompt_error = err_msg
             # Keep detector usable even if prompt embedding setup fails.
             try:
                 self._load_detector()
+                self.active_prompt_classes = cls_tuple
+                self.active_prompt_error = err_msg
             except Exception:
                 pass
         return self.active_prompt_error
@@ -529,6 +558,12 @@ class RealtimeEngine:
         run_img_size, run_conf, run_mode = self._select_adaptive_infer_settings(base_img_size, float(conf_thres))
 
         prompt_error = self._apply_prompt_classes_if_needed(class_prompt)
+        prompt_active = bool(self.active_prompt_classes)
+        if prompt_active and not prompt_error:
+            run_img_size = max(run_img_size, max(320, (PROMPT_IMG_SIZE // 32) * 32))
+            run_img_size = min(768, run_img_size)
+            run_conf = min(run_conf, float(np.clip(PROMPT_CONF_CAP, 0.01, 0.25)))
+            run_mode = f"{run_mode}+prompt"
 
         depth_map = None
         depth_error = None
@@ -570,6 +605,7 @@ class RealtimeEngine:
 
         with torch.inference_mode():
             assert self.model is not None
+            infer_half = bool(self.use_half and not self.prompt_fp32_active)
             results = self.model.predict(
                 source=infer_frame_bgr,
                 imgsz=run_img_size,
@@ -577,11 +613,36 @@ class RealtimeEngine:
                 iou=float(iou_thres),
                 max_det=int(max_det),
                 device=self.device,
-                half=self.use_half,
+                half=infer_half,
                 verbose=False,
             )
         pred = results[0] if results else None
         boxes = pred.boxes if pred is not None else None
+
+        if prompt_active and not prompt_error and (boxes is None or len(boxes) == 0):
+            retry_conf = float(np.clip(PROMPT_CONF_RETRY, 0.005, max(0.05, run_conf)))
+            retry_img = max(run_img_size, max(320, (PROMPT_IMG_SIZE // 32) * 32))
+            with torch.inference_mode():
+                results_retry = self.model.predict(
+                    source=infer_frame_bgr,
+                    imgsz=retry_img,
+                    conf=retry_conf,
+                    iou=float(iou_thres),
+                    max_det=int(max_det),
+                    device=self.device,
+                    half=infer_half,
+                    verbose=False,
+                )
+            if results_retry:
+                pred_retry = results_retry[0]
+                boxes_retry = pred_retry.boxes
+                if boxes_retry is not None and len(boxes_retry) > 0:
+                    results = results_retry
+                    pred = pred_retry
+                    boxes = boxes_retry
+                    run_mode = f"{run_mode}+retry"
+                    run_conf = retry_conf
+                    run_img_size = retry_img
 
         nearest_info = None
         fusion_w_mean = None
@@ -773,7 +834,8 @@ class RealtimeEngine:
             stats += f" | depth_async={'1' if depth_busy else '0'}"
             if depth_age >= 0:
                 stats += f" | depth_age={depth_age:.1f}s"
-        stats += f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
+        stats += f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if infer_half else 0} | cpu_t={self.cpu_threads}"
+        stats += f" | build={APP_BUILD}"
         if depth_enabled:
             stats += f" | depth_model={self.depth_model_name}"
         result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)

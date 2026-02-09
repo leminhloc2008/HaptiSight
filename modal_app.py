@@ -1,9 +1,10 @@
 import os
 import sys
+import importlib.util
 
 import modal
 
-APP_NAME = "yoloer-v2-realtime-fixcam2"
+APP_NAME = "yoloer-v2-realtime-fixcam3"
 PROJECT_DIR = "/root/hf_space_deploy"
 CACHE_DIR = "/tmp/yoloer_cache"
 
@@ -29,7 +30,7 @@ image = (
             "TORCH_HOME": f"{CACHE_DIR}/torch",
             "XDG_CACHE_HOME": f"{CACHE_DIR}/xdg",
             "FORCE_CPU": "0",
-            "USE_FP16": os.getenv("USE_FP16", "1"),
+            "USE_FP16": os.getenv("USE_FP16", "0"),
             "CPU_THREADS": os.getenv("CPU_THREADS", "4"),
             "YOLOE_MODEL_ID": os.getenv("YOLOE_MODEL_ID", "yoloe-11m"),
             "MAX_FRAME_EDGE": os.getenv("MAX_FRAME_EDGE", "640"),
@@ -41,7 +42,7 @@ image = (
             "RECOVERY_IMG_BOOST": os.getenv("RECOVERY_IMG_BOOST", "96"),
             "RECOVERY_MISS_THRESHOLD": os.getenv("RECOVERY_MISS_THRESHOLD", "2"),
             "DEPTH_MODEL": os.getenv("DEPTH_MODEL", "DPT_Hybrid"),
-            "DEPTH_FP16": os.getenv("DEPTH_FP16", "1"),
+            "DEPTH_FP16": os.getenv("DEPTH_FP16", "0"),
             "WEBCAM_CAPTURE_W": os.getenv("WEBCAM_CAPTURE_W", "640"),
             "WEBCAM_CAPTURE_H": os.getenv("WEBCAM_CAPTURE_H", "360"),
             "WEBCAM_CAPTURE_FPS": os.getenv("WEBCAM_CAPTURE_FPS", "24"),
@@ -56,6 +57,18 @@ image = (
 
 modal_app = modal.App(APP_NAME)
 app = modal_app
+
+
+def _load_app_module():
+    app_path = os.path.join(PROJECT_DIR, "app.py")
+    if PROJECT_DIR not in sys.path:
+        sys.path.insert(0, PROJECT_DIR)
+    spec = importlib.util.spec_from_file_location("yoloer_runtime_app", app_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load app module from {app_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @modal_app.function(
@@ -73,10 +86,10 @@ def web():
     from fastapi import FastAPI
 
     os.chdir(PROJECT_DIR)
-    if PROJECT_DIR not in sys.path:
-        sys.path.insert(0, PROJECT_DIR)
-
-    from app import demo, get_engine, get_worker  # noqa: WPS433
+    module = _load_app_module()
+    demo = module.demo
+    get_engine = module.get_engine
+    get_worker = module.get_worker
 
     # Preload model and worker once per container to reduce first-frame lag.
     try:
@@ -98,12 +111,8 @@ def web():
 )
 def warmup():
     os.chdir(PROJECT_DIR)
-    if PROJECT_DIR not in sys.path:
-        sys.path.insert(0, PROJECT_DIR)
-
-    from app import get_engine  # noqa: WPS433
-
-    engine = get_engine()
+    module = _load_app_module()
+    engine = module.get_engine()
     return {
         "status": "warmup_done",
         "device": engine.device,
@@ -111,6 +120,8 @@ def warmup():
         "use_fp16": bool(engine.use_half),
         "detector": engine.detector_label,
         "depth_model": engine.depth_model_name,
+        "app_build": getattr(module, "APP_BUILD", "unknown"),
+        "app_file": getattr(module, "__file__", "unknown"),
     }
 
 
@@ -131,12 +142,8 @@ def benchmark(
     import numpy as np
 
     os.chdir(PROJECT_DIR)
-    if PROJECT_DIR not in sys.path:
-        sys.path.insert(0, PROJECT_DIR)
-
-    from app import get_engine  # noqa: WPS433
-
-    engine = get_engine()
+    module = _load_app_module()
+    engine = module.get_engine()
     frame = np.random.randint(0, 255, (360, 640, 3), dtype=np.uint8)
 
     # Warmup
