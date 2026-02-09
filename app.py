@@ -332,6 +332,12 @@ class RealtimeEngine:
         assert self.model is not None
         try:
             embeddings = self.model.get_text_pe(classes)
+            model_dtype = torch.float16 if self.use_half else torch.float32
+            try:
+                model_dtype = next(self.model.model.parameters()).dtype  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            embeddings = embeddings.to(device=self.torch_device, dtype=model_dtype)
             self.model.set_classes(classes, embeddings)
             self.names = self._names_to_dict(getattr(self.model, "names", classes))
             self.active_prompt_classes = cls_tuple
@@ -339,6 +345,11 @@ class RealtimeEngine:
         except Exception as exc:
             self.active_prompt_classes = cls_tuple
             self.active_prompt_error = f"Khong set duoc YOLOE prompt classes: {exc}"
+            # Keep detector usable even if prompt embedding setup fails.
+            try:
+                self._load_detector()
+            except Exception:
+                pass
         return self.active_prompt_error
 
     def _class_name(self, cls_id: int) -> str:
@@ -1168,7 +1179,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
-                format="webp",
+                format="jpeg",
                 sources=["webcam"],
                 streaming=True,
                 height=300,
@@ -1188,7 +1199,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", format="webp", height=300)
+            result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")
             plan_btn = gr.Button("Generate Smart Guidance (Gemini)")
             plan_md = gr.Markdown("Guidance plan will appear here.")
