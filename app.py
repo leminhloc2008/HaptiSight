@@ -22,6 +22,9 @@ MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "448"))
 MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
 MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "256"))
 CAM_FOV_DEG = float(os.getenv("CAM_FOV_DEG", "70.0"))
+WEBCAM_CAPTURE_W = int(os.getenv("WEBCAM_CAPTURE_W", "640"))
+WEBCAM_CAPTURE_H = int(os.getenv("WEBCAM_CAPTURE_H", "360"))
+WEBCAM_CAPTURE_FPS = int(os.getenv("WEBCAM_CAPTURE_FPS", "24"))
 
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
 
@@ -903,30 +906,30 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
     if gpu_mode:
         return {
             "Realtime": {
-                "conf": 0.40,
+                "conf": 0.42,
                 "iou": 0.50,
-                "img_size": 512,
-                "max_det": 20,
+                "img_size": 448,
+                "max_det": 16,
                 "smooth": 0.35,
-                "depth_enabled": True,
+                "depth_enabled": False,
                 "depth_alpha": 0.08,
-                "depth_interval": 5,
+                "depth_interval": 6,
             },
             "Balanced": {
-                "conf": 0.34,
+                "conf": 0.36,
                 "iou": 0.52,
-                "img_size": 640,
-                "max_det": 28,
+                "img_size": 576,
+                "max_det": 24,
                 "smooth": 0.45,
                 "depth_enabled": True,
-                "depth_alpha": 0.10,
-                "depth_interval": 3,
+                "depth_alpha": 0.09,
+                "depth_interval": 4,
             },
             "Precision": {
-                "conf": 0.28,
+                "conf": 0.30,
                 "iou": 0.55,
-                "img_size": 768,
-                "max_det": 40,
+                "img_size": 704,
+                "max_det": 36,
                 "smooth": 0.55,
                 "depth_enabled": True,
                 "depth_alpha": 0.12,
@@ -1165,7 +1168,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             webcam = gr.Image(
                 label="Webcam",
                 type="numpy",
-                format="jpeg",
+                format="webp",
                 sources=["webcam"],
                 streaming=True,
                 height=300,
@@ -1185,7 +1188,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
             depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
-            result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
+            result = gr.Image(label="Result", type="numpy", format="webp", height=300)
             stats = gr.Textbox(label="Runtime stats")
             plan_btn = gr.Button("Generate Smart Guidance (Gemini)")
             plan_md = gr.Markdown("Guidance plan will appear here.")

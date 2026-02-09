@@ -37,6 +37,12 @@ modal setup
 modal run modal_app.py::warmup
 ```
 
+Optional benchmark (server-side compute FPS, excludes browser network latency):
+
+```bash
+modal run modal_app.py::benchmark
+```
+
 ### 3) Deploy web app
 
 ```bash
@@ -51,11 +57,14 @@ After deploy, Modal returns a public URL for the ASGI app (`web` function).
 - `YOLOE_MODEL_ID`: default `yoloe-11m` on GPU
 - `USE_FP16`: default `1`
 - `DEPTH_MODEL`: default `DPT_Hybrid` on GPU
-- `MAX_FRAME_EDGE`: default `720`
-- `MAX_OUTPUT_EDGE`: default `640`
+- `MAX_FRAME_EDGE`: default `640`
+- `MAX_OUTPUT_EDGE`: default `416`
 - `MAX_DEPTH_EDGE`: default `384`
-- `HIRES_REFRESH_EVERY`: default `4`
+- `HIRES_REFRESH_EVERY`: default `3`
 - `FAST_SIZE_DELTA`: default `0`
+- `WEBCAM_CAPTURE_W`: default `640`
+- `WEBCAM_CAPTURE_H`: default `360`
+- `WEBCAM_CAPTURE_FPS`: default `24`
 
 ### 1) Recommended detector for CPU realtime
 
