@@ -21,12 +21,13 @@ from ultralytics import YOLOE
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
 MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "448"))
-MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "416"))
+MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "360"))
 MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "256"))
 CAM_FOV_DEG = float(os.getenv("CAM_FOV_DEG", "70.0"))
 WEBCAM_CAPTURE_W = int(os.getenv("WEBCAM_CAPTURE_W", "640"))
 WEBCAM_CAPTURE_H = int(os.getenv("WEBCAM_CAPTURE_H", "360"))
 WEBCAM_CAPTURE_FPS = int(os.getenv("WEBCAM_CAPTURE_FPS", "24"))
+OUTPUT_JPEG_QUALITY = int(os.getenv("OUTPUT_JPEG_QUALITY", "68"))
 
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
 
@@ -163,6 +164,7 @@ class RealtimeEngine:
         self.xyz_filter_state: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
         self.depth_estimator = None
         self.depth_last_map = None
+        self.depth_last_shape = None
         self.depth_last_latency_ms = 0.0
         self.depth_frame_counter = 0
         self.depth_last_update_ts = 0.0
@@ -414,6 +416,7 @@ class RealtimeEngine:
             latency_ms = (time.perf_counter() - t0) * 1000.0
             with self.depth_lock:
                 self.depth_last_map = depth_map
+                self.depth_last_shape = tuple(int(v) for v in frame_rgb.shape[:2])
                 self.depth_last_latency_ms = latency_ms
                 self.depth_last_update_ts = time.time()
                 self.depth_last_error = None
@@ -434,13 +437,21 @@ class RealtimeEngine:
         self.depth_frame_counter += 1
         depth_interval = max(1, int(depth_interval))
         with self.depth_lock:
-            has_map = self.depth_last_map is not None
+            frame_shape = tuple(int(v) for v in frame_rgb.shape[:2])
+            now_ts = time.time()
+            age_s = (now_ts - self.depth_last_update_ts) if self.depth_last_update_ts > 0 else 1e9
+            max_age_s = max(2.0, 0.5 * float(depth_interval))
+            has_map = (
+                (self.depth_last_map is not None)
+                and (self.depth_last_shape == frame_shape)
+                and (age_s <= max_age_s)
+            )
             refresh = (not has_map) or (self.depth_frame_counter % depth_interval == 0)
             if refresh and (not self.depth_job_busy):
                 self.depth_job_busy = True
                 job_frame = frame_rgb.copy()
                 threading.Thread(target=self._depth_job, args=(job_frame,), daemon=True).start()
-            depth_map = self.depth_last_map
+            depth_map = self.depth_last_map if has_map else None
             depth_err = self.depth_last_error
         return depth_map, depth_err
 
@@ -529,10 +540,33 @@ class RealtimeEngine:
                 depth_map = None
 
         if depth_map is not None and depth_alpha > 0:
-            depth_uint8 = (np.clip(depth_map, 0.0, 1.0) * 255.0).astype(np.uint8)
-            depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
-            alpha = float(np.clip(depth_alpha, 0.0, 0.8))
-            frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
+            try:
+                depth_arr = np.asarray(depth_map, dtype=np.float32)
+                if depth_arr.ndim == 3:
+                    depth_arr = depth_arr[..., 0]
+                if depth_arr.ndim != 2:
+                    raise ValueError(f"depth_ndim={depth_arr.ndim}")
+                if depth_arr.shape[:2] != frame_bgr.shape[:2]:
+                    depth_arr = cv2.resize(
+                        depth_arr,
+                        (img_w, img_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                depth_uint8 = (np.clip(depth_arr, 0.0, 1.0) * 255.0).astype(np.uint8)
+                depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
+                if depth_color.shape[:2] != frame_bgr.shape[:2]:
+                    depth_color = cv2.resize(
+                        depth_color,
+                        (img_w, img_h),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                if depth_color.dtype != frame_bgr.dtype:
+                    depth_color = depth_color.astype(frame_bgr.dtype, copy=False)
+                alpha = float(np.clip(depth_alpha, 0.0, 0.8))
+                frame_bgr = cv2.addWeighted(frame_bgr, 1.0 - alpha, depth_color, alpha, 0.0)
+            except Exception as exc:
+                overlay_err = f"depth_overlay_err={exc}"
+                depth_error = f"{depth_error}; {overlay_err}" if depth_error else overlay_err
 
         with torch.inference_mode():
             assert self.model is not None
@@ -948,6 +982,7 @@ def process_frame(
         out_frame = normalize_frame(out_frame)
     if out_frame is None:
         out_frame = frame
+    out_frame = downscale_frame(out_frame, MAX_OUTPUT_EDGE)
     return frame_to_html(out_frame), out_stats
 
 
@@ -957,24 +992,24 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
     if gpu_mode:
         return {
             "Realtime": {
-                "conf": 0.42,
-                "iou": 0.50,
-                "img_size": 448,
+                "conf": 0.34,
+                "iou": 0.52,
+                "img_size": 512,
                 "max_det": 16,
                 "smooth": 0.35,
                 "depth_enabled": False,
                 "depth_alpha": 0.08,
-                "depth_interval": 6,
+                "depth_interval": 8,
             },
             "Balanced": {
-                "conf": 0.36,
+                "conf": 0.33,
                 "iou": 0.52,
-                "img_size": 576,
+                "img_size": 608,
                 "max_det": 24,
                 "smooth": 0.45,
-                "depth_enabled": True,
-                "depth_alpha": 0.09,
-                "depth_interval": 4,
+                "depth_enabled": False,
+                "depth_alpha": 0.07,
+                "depth_interval": 6,
             },
             "Precision": {
                 "conf": 0.30,
@@ -1276,7 +1311,7 @@ def normalize_frame(frame) -> Optional[np.ndarray]:
     return np.ascontiguousarray(arr)
 
 
-def frame_to_imagedata(frame: Optional[np.ndarray], quality: int = 82) -> Dict[str, object]:
+def frame_to_imagedata(frame: Optional[np.ndarray], quality: int = OUTPUT_JPEG_QUALITY) -> Dict[str, object]:
     arr = normalize_frame(frame)
     if arr is None:
         arr = np.zeros((max(32, WEBCAM_CAPTURE_H), max(32, WEBCAM_CAPTURE_W), 3), dtype=np.uint8)
