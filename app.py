@@ -46,8 +46,10 @@ class DistanceMLP:
 
 
 class MidasDepthEstimator:
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, model_name: str = "MiDaS_small", use_half: bool = False):
         self.device = device
+        self.model_name = model_name
+        self.use_half = bool(use_half and device.type == "cuda")
         self.model = None
         self.transform = None
         self.error_message = None
@@ -67,12 +69,17 @@ class MidasDepthEstimator:
 
         try:
             torch.hub.set_dir(str(ROOT / ".torch_hub_cache"))
-            self.model = self._hub_load("intel-isl/MiDaS", "MiDaS_small")
+            self.model = self._hub_load("intel-isl/MiDaS", self.model_name)
             transforms = self._hub_load("intel-isl/MiDaS", "transforms")
-            self.transform = transforms.small_transform
+            if self.model_name == "MiDaS_small":
+                self.transform = transforms.small_transform
+            else:
+                self.transform = transforms.dpt_transform
             self.model.to(self.device).eval()
+            if self.use_half:
+                self.model.half()
         except Exception as exc:
-            self.error_message = f"Khong tai duoc MiDaS_small: {exc}"
+            self.error_message = f"Khong tai duoc {self.model_name}: {exc}"
             raise RuntimeError(self.error_message)
 
     def predict(self, frame_rgb: np.ndarray, max_edge: int) -> np.ndarray:
@@ -81,6 +88,8 @@ class MidasDepthEstimator:
 
         with torch.inference_mode():
             inp = self.transform(frame_input).to(self.device)
+            if self.use_half:
+                inp = inp.half()
             pred = self.model(inp)
             pred = F.interpolate(
                 pred.unsqueeze(1),
@@ -101,10 +110,17 @@ class RealtimeEngine:
     ORIG_HEIGHT = 375.0
     ORIG_WIDTH = 1242.0
     YOLOE_REPO_ID = "jameslahm/yoloe"
-    DEFAULT_MODEL_ID = "yoloe-11s"
+    CPU_DEFAULT_MODEL_ID = "yoloe-11s"
+    GPU_DEFAULT_MODEL_ID = "yoloe-11m"
     FALLBACK_MODEL_ID = "yoloe-v8s"
 
     def __init__(self):
+        force_cpu = os.getenv("FORCE_CPU", "0").strip().lower() in {"1", "true", "yes"}
+        self.use_cuda = (not force_cpu) and torch.cuda.is_available()
+        self.device = "cuda:0" if self.use_cuda else "cpu"
+        self.torch_device = torch.device(self.device)
+        self.use_half = bool(self.use_cuda and os.getenv("USE_FP16", "1").strip().lower() in {"1", "true", "yes"})
+
         env_threads = os.getenv("CPU_THREADS", "").strip()
         if env_threads:
             requested_threads = max(1, int(env_threads))
@@ -112,15 +128,20 @@ class RealtimeEngine:
             # Default auto-tuning for HF CPU: leave 1 core for system/Gradio threads.
             cpu_count = max(2, (os.cpu_count() or 4))
             requested_threads = max(2, min(8, cpu_count - 1))
-        try:
-            torch.set_num_threads(requested_threads)
-            torch.set_num_interop_threads(1)
-            torch.set_flush_denormal(True)
-        except RuntimeError:
-            pass
+        if not self.use_cuda:
+            try:
+                torch.set_num_threads(requested_threads)
+                torch.set_num_interop_threads(1)
+                torch.set_flush_denormal(True)
+            except RuntimeError:
+                pass
+        else:
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
 
-        self.torch_device = torch.device("cpu")
-        self.device = "cpu"
         self.cpu_threads = requested_threads
         self.weights_path = self._resolve_weights_path()
         self.detector_label = Path(self.weights_path).name
@@ -149,12 +170,16 @@ class RealtimeEngine:
         self.fast_size_delta = max(0, int(os.getenv("FAST_SIZE_DELTA", "64")))
         self.recovery_img_boost = max(0, int(os.getenv("RECOVERY_IMG_BOOST", "64")))
         self.recovery_miss_threshold = max(1, int(os.getenv("RECOVERY_MISS_THRESHOLD", "2")))
+        default_depth_model = "DPT_Hybrid" if self.use_cuda else "MiDaS_small"
+        self.depth_model_name = os.getenv("DEPTH_MODEL", default_depth_model).strip() or default_depth_model
+        self.depth_use_half = bool(self.use_half and os.getenv("DEPTH_FP16", "1").strip().lower() in {"1", "true", "yes"})
 
     def _select_adaptive_infer_settings(self, base_img_size: int, base_conf: float) -> Tuple[int, float, str]:
         self.det_frame_counter += 1
         base_img_size = int(np.clip(base_img_size, 128, 640))
         base_img_size = max(128, (base_img_size // 32) * 32)
-        fast_img = max(128, ((base_img_size - self.fast_size_delta) // 32) * 32)
+        fast_delta = 0 if self.use_cuda else self.fast_size_delta
+        fast_img = max(128, ((base_img_size - fast_delta) // 32) * 32)
 
         periodic_hires = (self.det_frame_counter % self.hires_refresh_every) == 0
         recovery_hires = (
@@ -169,11 +194,11 @@ class RealtimeEngine:
         if use_hires:
             mode = "hires"
         if self.miss_streak >= self.recovery_miss_threshold:
-            run_conf = max(0.20, float(base_conf) - 0.06)
+            run_conf = max(0.16 if self.use_cuda else 0.20, float(base_conf) - 0.06)
         if recovery_hires:
             run_img = min(640, max(run_img, base_img_size + self.recovery_img_boost))
             run_img = max(128, (run_img // 32) * 32)
-            run_conf = max(0.18, float(base_conf) - 0.10)
+            run_conf = max(0.14 if self.use_cuda else 0.18, float(base_conf) - 0.10)
             mode = "recover"
         return int(run_img), float(run_conf), mode
 
@@ -208,7 +233,8 @@ class RealtimeEngine:
                 "Dat YOLOE_WEIGHTS la duong dan ton tai hoac URL hop le."
             )
 
-        requested_model = os.getenv("YOLOE_MODEL_ID", self.DEFAULT_MODEL_ID).strip() or self.DEFAULT_MODEL_ID
+        default_model = self.GPU_DEFAULT_MODEL_ID if self.use_cuda else self.CPU_DEFAULT_MODEL_ID
+        requested_model = os.getenv("YOLOE_MODEL_ID", default_model).strip() or default_model
         requested_file = self._model_filename(requested_model)
         try:
             return hf_hub_download(repo_id=self.YOLOE_REPO_ID, filename=requested_file)
@@ -250,10 +276,24 @@ class RealtimeEngine:
         self.model = YOLOE(self.weights_path)
         self.model.to(self.device)
         self.model.eval()
+        if self.use_half and hasattr(self.model, "model"):
+            try:
+                self.model.model.half()
+            except Exception:
+                self.use_half = False
         # One tiny warmup pass to reduce first-frame latency spikes.
         try:
-            warm = np.zeros((128, 128, 3), dtype=np.uint8)
-            self.model.predict(source=warm, imgsz=128, conf=0.5, iou=0.45, max_det=1, device=self.device, verbose=False)
+            warm = np.zeros((160, 160, 3), dtype=np.uint8)
+            self.model.predict(
+                source=warm,
+                imgsz=160,
+                conf=0.5,
+                iou=0.45,
+                max_det=1,
+                device=self.device,
+                half=self.use_half,
+                verbose=False,
+            )
         except Exception:
             pass
         self.base_names = self._names_to_dict(getattr(self.model, "names", None))
@@ -348,7 +388,11 @@ class RealtimeEngine:
     def _depth_job(self, frame_rgb: np.ndarray) -> None:
         try:
             if self.depth_estimator is None:
-                self.depth_estimator = MidasDepthEstimator(self.torch_device)
+                self.depth_estimator = MidasDepthEstimator(
+                    self.torch_device,
+                    model_name=self.depth_model_name,
+                    use_half=self.depth_use_half,
+                )
             t0 = time.perf_counter()
             depth_map = self.depth_estimator.predict(frame_rgb, MAX_DEPTH_EDGE)
             latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -483,6 +527,7 @@ class RealtimeEngine:
                 iou=float(iou_thres),
                 max_det=int(max_det),
                 device=self.device,
+                half=self.use_half,
                 verbose=False,
             )
         pred = results[0] if results else None
@@ -533,7 +578,8 @@ class RealtimeEngine:
                 fps = 1000.0 / max(latency_ms, 1e-6)
                 stats = (
                     f"detector={self.detector_label} | objects=0 | latency={latency_ms:.1f}ms | fps~{fps:.1f}"
-                    f" | mode={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak} | cpu_t={self.cpu_threads}"
+                    f" | mode={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
+                    f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
                 )
                 result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
@@ -677,7 +723,9 @@ class RealtimeEngine:
             stats += f" | depth_async={'1' if depth_busy else '0'}"
             if depth_age >= 0:
                 stats += f" | depth_age={depth_age:.1f}s"
-        stats += f" | cpu_t={self.cpu_threads}"
+        stats += f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
+        if depth_enabled:
+            stats += f" | depth_model={self.depth_model_name}"
         result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         result_rgb = downscale_frame(result_rgb, MAX_OUTPUT_EDGE)
         scene_state = {
@@ -849,38 +897,78 @@ def process_frame(
     return out_frame, out_stats, session_worker
 
 
-PROFILE_PRESETS = {
-    "Realtime": {
-        "conf": 0.48,
-        "iou": 0.45,
-        "img_size": 224,
-        "max_det": 6,
-        "smooth": 0.42,
-        "depth_enabled": False,
-        "depth_alpha": 0.10,
-        "depth_interval": 8,
-    },
-    "Balanced": {
-        "conf": 0.42,
-        "iou": 0.45,
-        "img_size": 256,
-        "max_det": 8,
-        "smooth": 0.55,
-        "depth_enabled": True,
-        "depth_alpha": 0.15,
-        "depth_interval": 7,
-    },
-    "Precision": {
-        "conf": 0.32,
-        "iou": 0.50,
-        "img_size": 320,
-        "max_det": 16,
-        "smooth": 0.62,
-        "depth_enabled": True,
-        "depth_alpha": 0.18,
-        "depth_interval": 5,
-    },
-}
+def _build_profile_presets() -> Dict[str, Dict[str, float]]:
+    force_cpu = os.getenv("FORCE_CPU", "0").strip().lower() in {"1", "true", "yes"}
+    gpu_mode = (not force_cpu) and torch.cuda.is_available()
+    if gpu_mode:
+        return {
+            "Realtime": {
+                "conf": 0.40,
+                "iou": 0.50,
+                "img_size": 512,
+                "max_det": 20,
+                "smooth": 0.35,
+                "depth_enabled": True,
+                "depth_alpha": 0.08,
+                "depth_interval": 5,
+            },
+            "Balanced": {
+                "conf": 0.34,
+                "iou": 0.52,
+                "img_size": 640,
+                "max_det": 28,
+                "smooth": 0.45,
+                "depth_enabled": True,
+                "depth_alpha": 0.10,
+                "depth_interval": 3,
+            },
+            "Precision": {
+                "conf": 0.28,
+                "iou": 0.55,
+                "img_size": 768,
+                "max_det": 40,
+                "smooth": 0.55,
+                "depth_enabled": True,
+                "depth_alpha": 0.12,
+                "depth_interval": 2,
+            },
+        }
+
+    return {
+        "Realtime": {
+            "conf": 0.48,
+            "iou": 0.45,
+            "img_size": 224,
+            "max_det": 6,
+            "smooth": 0.42,
+            "depth_enabled": False,
+            "depth_alpha": 0.10,
+            "depth_interval": 8,
+        },
+        "Balanced": {
+            "conf": 0.42,
+            "iou": 0.45,
+            "img_size": 256,
+            "max_det": 8,
+            "smooth": 0.55,
+            "depth_enabled": True,
+            "depth_alpha": 0.15,
+            "depth_interval": 7,
+        },
+        "Precision": {
+            "conf": 0.32,
+            "iou": 0.50,
+            "img_size": 320,
+            "max_det": 16,
+            "smooth": 0.62,
+            "depth_enabled": True,
+            "depth_alpha": 0.18,
+            "depth_interval": 5,
+        },
+    }
+
+
+PROFILE_PRESETS = _build_profile_presets()
 
 
 def apply_profile(profile_name: str):
@@ -1032,11 +1120,11 @@ def run_smart_planner(user_query: str, profile_name: str, api_key_input: str, se
 
 
 DESCRIPTION = (
-    "YOLOER V2 tren Hugging Face Spaces (CPU realtime webcam). "
-    "Object detection da chuyen sang YOLOE (THU-MIG) de tang do chinh xac. "
+    "YOLOER V2 realtime webcam (CPU/GPU). "
+    "Object detection dung YOLOE (THU-MIG) toi uu do chinh xac + toc do. "
     "Engine su dung adaptive infer (fast frame + hires refresh) va depth async de giam lag. "
     "Co the nhap prompt classes de tap trung vao nhom vat the muc tieu. "
-    "Co the bat MiDaS v2.1 Small de phan tich depth va toa do 3D theo thoi gian thuc."
+    "Co the bat MiDaS depth de phan tich khoang cach va toa do 3D theo thoi gian thuc."
 )
 
 def downscale_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
@@ -1052,9 +1140,10 @@ def downscale_frame(frame: np.ndarray, max_edge: int) -> np.ndarray:
     return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
-    gr.Markdown("## YOLOER V2 - Realtime Distance Estimation on CPU")
+with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
+    gr.Markdown("## YOLOER V2 - Realtime Distance Estimation")
     gr.Markdown(DESCRIPTION)
+    _default_profile = PROFILE_PRESETS["Realtime"]
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -1081,20 +1170,20 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation on CPU") as demo:
                 streaming=True,
                 height=300,
             )
-            conf_slider = gr.Slider(0.10, 0.90, value=0.48, step=0.01, label="Confidence threshold")
+            conf_slider = gr.Slider(0.10, 0.90, value=_default_profile["conf"], step=0.01, label="Confidence threshold")
             iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
-            size_slider = gr.Slider(192, 512, value=224, step=32, label="Inference image size")
-            max_det_slider = gr.Slider(1, 60, value=6, step=1, label="Max detections")
-            smooth_slider = gr.Slider(0.0, 0.95, value=0.42, step=0.01, label="Distance smoothing")
+            size_slider = gr.Slider(192, 768, value=_default_profile["img_size"], step=32, label="Inference image size")
+            max_det_slider = gr.Slider(1, 80, value=_default_profile["max_det"], step=1, label="Max detections")
+            smooth_slider = gr.Slider(0.0, 0.95, value=_default_profile["smooth"], step=0.01, label="Distance smoothing")
             class_prompt = gr.Textbox(
                 label="YOLOE prompt classes (optional, comma-separated)",
                 value="",
                 lines=2,
                 placeholder="cup, bottle, apple, cell phone",
             )
-            depth_enabled = gr.Checkbox(value=False, label="Enable MiDaS v2.1 Small depth")
-            depth_alpha = gr.Slider(0.0, 0.7, value=0.10, step=0.01, label="Depth overlay alpha")
-            depth_interval = gr.Slider(1, 8, value=8, step=1, label="Depth update every N frames")
+            depth_enabled = gr.Checkbox(value=bool(_default_profile["depth_enabled"]), label="Enable MiDaS depth")
+            depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
+            depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
         with gr.Column(scale=1):
             result = gr.Image(label="Result", type="numpy", format="jpeg", height=300)
             stats = gr.Textbox(label="Runtime stats")

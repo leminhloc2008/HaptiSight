@@ -20,13 +20,15 @@ The runtime engine uses adaptive detection scheduling (fast frames + periodic hi
 
 ## Modal Deployment (Alternative)
 
-You can deploy the same realtime Gradio app on Modal using `modal_app.py`.
+You can deploy the same realtime Gradio app on Modal using `modal_app.py` with GPU.
 
 ### 1) Install and login
 
 ```bash
 pip install -U modal
 modal setup
+# or non-interactive:
+# modal token set --token-id <ID> --token-secret <SECRET>
 ```
 
 ### 2) Optional warmup (download model/cache once)
@@ -45,11 +47,15 @@ After deploy, Modal returns a public URL for the ASGI app (`web` function).
 
 ### 4) Optional runtime tuning (env)
 
-- `CPU_THREADS` (default `7`)
-- `MAX_FRAME_EDGE` (default `448`)
-- `MAX_DEPTH_EDGE` (default `256`)
-- `HIRES_REFRESH_EVERY` (default `6`)
-- `FAST_SIZE_DELTA` (default `64`)
+- `MODAL_GPU`: `A10G` (default), `L4`, `L40S`, `A100`, `H100`, `T4`
+- `YOLOE_MODEL_ID`: default `yoloe-11m` on GPU
+- `USE_FP16`: default `1`
+- `DEPTH_MODEL`: default `DPT_Hybrid` on GPU
+- `MAX_FRAME_EDGE`: default `720`
+- `MAX_OUTPUT_EDGE`: default `640`
+- `MAX_DEPTH_EDGE`: default `384`
+- `HIRES_REFRESH_EVERY`: default `4`
+- `FAST_SIZE_DELTA`: default `0`
 
 ### 1) Recommended detector for CPU realtime
 
