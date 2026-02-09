@@ -3,7 +3,7 @@ import sys
 
 import modal
 
-APP_NAME = "yoloer-v2-realtime-fixcam"
+APP_NAME = "yoloer-v2-realtime-fixcam2"
 PROJECT_DIR = "/root/hf_space_deploy"
 CACHE_DIR = "/tmp/yoloer_cache"
 
@@ -78,7 +78,7 @@ def web():
     from app import demo  # noqa: WPS433
 
     api = FastAPI(title="YOLOER V2 on Modal")
-    return gr.mount_gradio_app(api, demo, path="/", root_path="/")
+    return gr.mount_gradio_app(api, demo, path="/")
 
 
 @modal_app.function(

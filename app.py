@@ -1311,7 +1311,10 @@ def frame_to_html(frame: Optional[np.ndarray]) -> str:
     )
 
 
-with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation") as demo:
+_local_theme = gr.themes.Base(font=["Arial", "sans-serif"], font_mono=["monospace"])
+
+
+with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_theme) as demo:
     gr.Markdown("## YOLOER V2 - Realtime Distance Estimation")
     gr.Markdown(DESCRIPTION)
     _default_profile = PROFILE_PRESETS["Realtime"]
