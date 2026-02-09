@@ -21,13 +21,14 @@ from ultralytics import YOLOE
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
 MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "448"))
-MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "360"))
+MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "320"))
 MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "256"))
 CAM_FOV_DEG = float(os.getenv("CAM_FOV_DEG", "70.0"))
 WEBCAM_CAPTURE_W = int(os.getenv("WEBCAM_CAPTURE_W", "640"))
 WEBCAM_CAPTURE_H = int(os.getenv("WEBCAM_CAPTURE_H", "360"))
 WEBCAM_CAPTURE_FPS = int(os.getenv("WEBCAM_CAPTURE_FPS", "24"))
-OUTPUT_JPEG_QUALITY = int(os.getenv("OUTPUT_JPEG_QUALITY", "68"))
+OUTPUT_JPEG_QUALITY = int(os.getenv("OUTPUT_JPEG_QUALITY", "58"))
+STREAM_EVERY_SEC = float(os.getenv("STREAM_EVERY_SEC", "0.08"))
 PROMPT_CONF_CAP = float(os.getenv("PROMPT_CONF_CAP", "0.02"))
 PROMPT_CONF_RETRY = float(os.getenv("PROMPT_CONF_RETRY", "0.01"))
 PROMPT_IMG_SIZE = int(os.getenv("PROMPT_IMG_SIZE", "640"))
@@ -911,6 +912,7 @@ class AsyncInferenceWorker:
         depth_enabled,
         depth_alpha,
         depth_interval,
+        prompt_enabled,
         class_prompt,
     ):
         frame = normalize_frame(frame)
@@ -926,7 +928,7 @@ class AsyncInferenceWorker:
             bool(depth_enabled),
             float(depth_alpha),
             int(depth_interval),
-            str(class_prompt or ""),
+            str(class_prompt or "") if bool(prompt_enabled) else "",
         )
         with self._lock:
             busy_before_submit = self._done_seq < self._pending_seq
@@ -1004,6 +1006,7 @@ def process_frame(
     depth_enabled,
     depth_alpha,
     depth_interval,
+    prompt_enabled,
     class_prompt,
 ):
     frame = normalize_frame(frame)
@@ -1038,6 +1041,7 @@ def process_frame(
         depth_enabled,
         depth_alpha,
         depth_interval,
+        prompt_enabled,
         class_prompt,
     )
     if out_frame is not None:
@@ -1458,6 +1462,10 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                 lines=2,
                 placeholder="cup, bottle, apple, cell phone",
             )
+            prompt_enabled = gr.Checkbox(
+                value=False,
+                label="Enable YOLOE prompt classes (slower)",
+            )
             depth_enabled = gr.Checkbox(value=bool(_default_profile["depth_enabled"]), label="Enable MiDaS depth")
             depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
             depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
@@ -1492,7 +1500,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "postprocess": False,
         "trigger_mode": "always_last",
         "concurrency_limit": 1,
-        "stream_every": 0.03,
+        "stream_every": STREAM_EVERY_SEC,
         "show_api": False,
     }
     supported_stream_args = set(inspect.signature(webcam.stream).parameters.keys())
@@ -1509,6 +1517,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             depth_enabled,
             depth_alpha,
             depth_interval,
+            prompt_enabled,
             class_prompt,
         ],
         outputs=[result, stats],

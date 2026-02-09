@@ -4,7 +4,7 @@ import importlib.util
 
 import modal
 
-APP_NAME = "yoloer-v2-realtime-fixcam3"
+APP_NAME = "yoloer-v2-realtime-stable4"
 PROJECT_DIR = "/root/hf_space_deploy"
 CACHE_DIR = "/tmp/yoloer_cache"
 
@@ -34,8 +34,9 @@ image = (
             "CPU_THREADS": os.getenv("CPU_THREADS", "4"),
             "YOLOE_MODEL_ID": os.getenv("YOLOE_MODEL_ID", "yoloe-11m"),
             "MAX_FRAME_EDGE": os.getenv("MAX_FRAME_EDGE", "640"),
-            "MAX_OUTPUT_EDGE": os.getenv("MAX_OUTPUT_EDGE", "360"),
-            "OUTPUT_JPEG_QUALITY": os.getenv("OUTPUT_JPEG_QUALITY", "68"),
+            "MAX_OUTPUT_EDGE": os.getenv("MAX_OUTPUT_EDGE", "320"),
+            "OUTPUT_JPEG_QUALITY": os.getenv("OUTPUT_JPEG_QUALITY", "58"),
+            "STREAM_EVERY_SEC": os.getenv("STREAM_EVERY_SEC", "0.08"),
             "MAX_DEPTH_EDGE": os.getenv("MAX_DEPTH_EDGE", "384"),
             "HIRES_REFRESH_EVERY": os.getenv("HIRES_REFRESH_EVERY", "3"),
             "FAST_SIZE_DELTA": os.getenv("FAST_SIZE_DELTA", "0"),
