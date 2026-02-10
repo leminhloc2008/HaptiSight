@@ -1,7 +1,9 @@
+clip @ git+https://github.com/ultralytics/CLIP.git
 gradio>=5.0.0
 h5py>=3.9.0
 huggingface-hub>=0.26.0
 matplotlib>=3.7.0
+mediapipe>=0.10.14
 numpy>=1.24.0
 opencv-python-headless>=4.8.0
 pandas>=1.5.0

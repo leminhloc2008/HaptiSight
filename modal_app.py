@@ -4,7 +4,7 @@ import importlib.util
 
 import modal
 
-APP_NAME = "yoloer-v2-realtime-stable4"
+APP_NAME = os.getenv("MODAL_APP_NAME", "yoloer-v2-realtime-stable15-targetlock").strip() or "yoloer-v2-realtime-stable15-targetlock"
 PROJECT_DIR = "/root/hf_space_deploy"
 CACHE_DIR = "/tmp/yoloer_cache"
 
@@ -32,18 +32,51 @@ image = (
             "FORCE_CPU": "0",
             "USE_FP16": os.getenv("USE_FP16", "0"),
             "CPU_THREADS": os.getenv("CPU_THREADS", "4"),
+            "YOLOE_WEIGHTS": os.getenv("YOLOE_WEIGHTS", "yoloe-11m-seg.pt"),
             "YOLOE_MODEL_ID": os.getenv("YOLOE_MODEL_ID", "yoloe-11m"),
-            "MAX_FRAME_EDGE": os.getenv("MAX_FRAME_EDGE", "640"),
+            "ACCURACY_RETRY_ENABLED": os.getenv("ACCURACY_RETRY_ENABLED", "1"),
+            "ACCURACY_RETRY_CONF": os.getenv("ACCURACY_RETRY_CONF", "0.12"),
+            "ACCURACY_RETRY_IMG": os.getenv("ACCURACY_RETRY_IMG", "768"),
+            "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
+            "GEMINI_TIMEOUT_S": os.getenv("GEMINI_TIMEOUT_S", "12"),
+            "GUIDE_GEMINI_MIN_INTERVAL_SEC": os.getenv("GUIDE_GEMINI_MIN_INTERVAL_SEC", "2.8"),
+            "GUIDE_GEMINI_RPM_LIMIT": os.getenv("GUIDE_GEMINI_RPM_LIMIT", "5"),
+            "GUIDE_GEMINI_HOURLY_LIMIT": os.getenv("GUIDE_GEMINI_HOURLY_LIMIT", "120"),
+            "GUIDE_GEMINI_BACKOFF_BASE_SEC": os.getenv("GUIDE_GEMINI_BACKOFF_BASE_SEC", "15"),
+            "GUIDE_GEMINI_BACKOFF_MAX_SEC": os.getenv("GUIDE_GEMINI_BACKOFF_MAX_SEC", "600"),
+            "GUIDE_GEMINI_SCENE_FORCE_SEC": os.getenv("GUIDE_GEMINI_SCENE_FORCE_SEC", "20"),
+            "GUIDE_GEMINI_ALWAYS_ON": os.getenv("GUIDE_GEMINI_ALWAYS_ON", "1"),
+            "GUIDE_TARGET_LOCK_SEC": os.getenv("GUIDE_TARGET_LOCK_SEC", "4.0"),
+            "TARGET_QUERY_MAX_CLASSES": os.getenv("TARGET_QUERY_MAX_CLASSES", "6"),
+            "GUIDE_DEPTH_HAZARD_X_M": os.getenv("GUIDE_DEPTH_HAZARD_X_M", "0.24"),
+            "GUIDE_DEPTH_HAZARD_Y_M": os.getenv("GUIDE_DEPTH_HAZARD_Y_M", "0.20"),
+            "GUIDE_DEPTH_HAZARD_FRONT_M": os.getenv("GUIDE_DEPTH_HAZARD_FRONT_M", "0.34"),
+            "GUIDE_DEPTH_HAZARD_BEHIND_M": os.getenv("GUIDE_DEPTH_HAZARD_BEHIND_M", "0.24"),
+            "MAX_FRAME_EDGE": os.getenv("MAX_FRAME_EDGE", "512"),
             "MAX_OUTPUT_EDGE": os.getenv("MAX_OUTPUT_EDGE", "320"),
-            "OUTPUT_JPEG_QUALITY": os.getenv("OUTPUT_JPEG_QUALITY", "58"),
-            "STREAM_EVERY_SEC": os.getenv("STREAM_EVERY_SEC", "0.08"),
+            "OUTPUT_JPEG_QUALITY": os.getenv("OUTPUT_JPEG_QUALITY", "50"),
+            "STREAM_EVERY_SEC": os.getenv("STREAM_EVERY_SEC", "0.05"),
             "MAX_DEPTH_EDGE": os.getenv("MAX_DEPTH_EDGE", "384"),
-            "HIRES_REFRESH_EVERY": os.getenv("HIRES_REFRESH_EVERY", "3"),
+            "HIRES_REFRESH_EVERY": os.getenv("HIRES_REFRESH_EVERY", "4"),
             "FAST_SIZE_DELTA": os.getenv("FAST_SIZE_DELTA", "0"),
-            "RECOVERY_IMG_BOOST": os.getenv("RECOVERY_IMG_BOOST", "96"),
-            "RECOVERY_MISS_THRESHOLD": os.getenv("RECOVERY_MISS_THRESHOLD", "2"),
+            "RECOVERY_IMG_BOOST": os.getenv("RECOVERY_IMG_BOOST", "0"),
+            "RECOVERY_MISS_THRESHOLD": os.getenv("RECOVERY_MISS_THRESHOLD", "5"),
             "DEPTH_MODEL": os.getenv("DEPTH_MODEL", "DPT_Hybrid"),
             "DEPTH_FP16": os.getenv("DEPTH_FP16", "0"),
+            "HAND_DETECT_ENABLED": os.getenv("HAND_DETECT_ENABLED", "1"),
+            "HAND_DETECT_EVERY_N": os.getenv("HAND_DETECT_EVERY_N", "3"),
+            "HAND_MAX_EDGE": os.getenv("HAND_MAX_EDGE", "256"),
+            "HAND_MIN_SCORE": os.getenv("HAND_MIN_SCORE", "0.35"),
+            "HAND_DETECT_MODE": os.getenv("HAND_DETECT_MODE", "hybrid"),
+            "HAND_YOLOE_ENABLED": os.getenv("HAND_YOLOE_ENABLED", "1"),
+            "HAND_YOLOE_EVERY_N": os.getenv("HAND_YOLOE_EVERY_N", "5"),
+            "HAND_YOLOE_IMG_SIZE": os.getenv("HAND_YOLOE_IMG_SIZE", "320"),
+            "HAND_YOLOE_CONF": os.getenv("HAND_YOLOE_CONF", "0.22"),
+            "HAND_YOLOE_MODEL_ID": os.getenv("HAND_YOLOE_MODEL_ID", "yoloe-v8s"),
+            "HAND_SMOOTH_ALPHA": os.getenv("HAND_SMOOTH_ALPHA", "0.55"),
+            "HAND_TARGET_REACH_M": os.getenv("HAND_TARGET_REACH_M", "0.12"),
+            "HAND_CONTACT_DIST_M": os.getenv("HAND_CONTACT_DIST_M", "0.06"),
+            "HAND_CONTACT_IOU": os.getenv("HAND_CONTACT_IOU", "0.18"),
             "WEBCAM_CAPTURE_W": os.getenv("WEBCAM_CAPTURE_W", "640"),
             "WEBCAM_CAPTURE_H": os.getenv("WEBCAM_CAPTURE_H", "360"),
             "WEBCAM_CAPTURE_FPS": os.getenv("WEBCAM_CAPTURE_FPS", "24"),
@@ -52,7 +85,17 @@ image = (
     .add_local_dir(
         ".",
         remote_path=PROJECT_DIR,
-        ignore=[".git", ".torch_hub_cache", "__pycache__", "*.pt", ".venv", ".idea"],
+        ignore=[".git", ".torch_hub_cache", "__pycache__", ".venv", ".idea"],
+        copy=True,
+    )
+    .run_commands(
+        "python -c \"import os,urllib.request;"
+        "p='/root/hf_space_deploy/mobileclip_blt.ts';"
+        "os.makedirs(os.path.dirname(p), exist_ok=True);"
+        "need=(not os.path.exists(p)) or (os.path.getsize(p) < 500_000_000);"
+        "print('mobileclip_cached_before', os.path.exists(p));"
+        "urllib.request.urlretrieve('https://github.com/ultralytics/assets/releases/download/v8.4.0/mobileclip_blt.ts', p) if need else None;"
+        "print('mobileclip_size', os.path.getsize(p))\""
     )
 )
 
@@ -78,9 +121,9 @@ def _load_app_module():
     cpu=6.0,
     memory=16384,
     timeout=60 * 60 * 24,
-    scaledown_window=15 * 60,
+    scaledown_window=60 * 60,
 )
-@modal.concurrent(max_inputs=16)
+@modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def web():
     import gradio as gr
@@ -121,6 +164,10 @@ def warmup():
         "use_fp16": bool(engine.use_half),
         "detector": engine.detector_label,
         "depth_model": engine.depth_model_name,
+        "hand_mode": getattr(engine, "hand_detect_mode", "unknown"),
+        "hand_yolo_enabled": bool(getattr(engine, "hand_yolo_enabled", False)),
+        "hand_yolo_loaded": bool(getattr(engine, "hand_yolo_model", None) is not None),
+        "hand_yolo_error": getattr(engine, "hand_yolo_error", None),
         "app_build": getattr(module, "APP_BUILD", "unknown"),
         "app_file": getattr(module, "__file__", "unknown"),
     }

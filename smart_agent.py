@@ -8,9 +8,10 @@ import requests
 
 
 DEFAULT_MODELS = [
-    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 
@@ -24,12 +25,23 @@ class PlanningResult:
     raw_text: Optional[str] = None
 
 
+@dataclass
+class RealtimeGuidanceResult:
+    ok: bool
+    model: str
+    latency_ms: float
+    say: str
+    output: Dict[str, Any]
+    error: Optional[str] = None
+    raw_text: Optional[str] = None
+
+
 class GeminiMultiAgentPlanner:
     def __init__(self, api_key: Optional[str] = None, models: Optional[List[str]] = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.models = models or DEFAULT_MODELS
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
-        self.timeout_s = 35
+        self.timeout_s = float(os.getenv("GEMINI_TIMEOUT_S", "12"))
 
     def plan(
         self,
@@ -61,14 +73,79 @@ class GeminiMultiAgentPlanner:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return PlanningResult(ok=False, model=",".join(self.models), latency_ms=latency_ms, output={}, error=last_error)
 
-    def _call_generate_content(self, model: str, prompt: str) -> str:
+    def guide_realtime(
+        self,
+        user_query: str,
+        scene_state: Dict[str, Any],
+        profile_name: str,
+        fov_deg: float,
+        previous_hint: str = "",
+    ) -> RealtimeGuidanceResult:
+        if not self.api_key:
+            return RealtimeGuidanceResult(
+                ok=False,
+                model="none",
+                latency_ms=0.0,
+                say="",
+                output={},
+                error="Missing GEMINI_API_KEY (or GOOGLE_API_KEY).",
+            )
+
+        prompt = self._build_realtime_prompt(user_query, scene_state, profile_name, fov_deg, previous_hint)
+        t0 = time.perf_counter()
+        last_error = None
+        variation_temp = 0.26 + 0.10 * ((int(time.time() * 10) % 3) / 2.0)
+        for model in self.models:
+            try:
+                text = self._call_generate_content(
+                    model,
+                    prompt,
+                    temperature=float(variation_temp),
+                    top_p=0.95,
+                    max_output_tokens=220,
+                )
+                data = self._parse_json_output(text)
+                say = self._sanitize_say(
+                    str(data.get("say") or data.get("guidance") or data.get("next_step") or "")
+                )
+                if not say:
+                    raise RuntimeError("Realtime guidance JSON missing 'say'.")
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                return RealtimeGuidanceResult(
+                    ok=True,
+                    model=model,
+                    latency_ms=latency_ms,
+                    say=say,
+                    output=data,
+                    raw_text=text,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return RealtimeGuidanceResult(
+            ok=False,
+            model=",".join(self.models),
+            latency_ms=latency_ms,
+            say="",
+            output={},
+            error=last_error,
+        )
+
+    def _call_generate_content(
+        self,
+        model: str,
+        prompt: str,
+        temperature: float = 0.15,
+        top_p: float = 0.9,
+        max_output_tokens: int = 900,
+    ) -> str:
         url = f"{self.base_url}/{model}:generateContent"
         payload = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.15,
-                "topP": 0.9,
-                "maxOutputTokens": 900,
+                "temperature": float(temperature),
+                "topP": float(top_p),
+                "maxOutputTokens": int(max_output_tokens),
             },
         }
         response = requests.post(
@@ -89,6 +166,23 @@ class GeminiMultiAgentPlanner:
         if not text:
             raise RuntimeError(f"Gemini returned empty text: {data}")
         return text
+
+    @staticmethod
+    def _sanitize_say(text: str) -> str:
+        clean = " ".join(str(text or "").replace("\n", " ").split())
+        if len(clean) > 260:
+            head = clean[:260].rstrip()
+            punct_idx = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
+            if punct_idx >= 80:
+                clean = head[: punct_idx + 1].strip()
+            else:
+                space_idx = head.rfind(" ")
+                clean = (head[:space_idx] if space_idx >= 80 else head).strip()
+                if clean and clean[-1] not in ".!?":
+                    clean = clean + "."
+        if clean and clean[-1] not in ".!?":
+            clean = clean + "."
+        return clean
 
     @staticmethod
     def _extract_json_block(text: str) -> str:
@@ -173,3 +267,56 @@ Return JSON schema:
 }}
 """.strip()
 
+    @staticmethod
+    def _build_realtime_prompt(
+        user_query: str,
+        scene_state: Dict[str, Any],
+        profile_name: str,
+        fov_deg: float,
+        previous_hint: str,
+    ) -> str:
+        scene_json = json.dumps(scene_state, ensure_ascii=True)
+        variation_seed = int(time.time() * 1000) % 1000000
+        return f"""
+You are a realtime assistive coach for a vision-impaired user.
+Return ONLY compact JSON.
+
+Inputs:
+- task: {user_query}
+- profile: {profile_name}
+- camera_fov_deg: {fov_deg}
+- previous_hint: {previous_hint}
+- variation_seed: {variation_seed}
+- scene_state: {scene_json}
+
+Rules:
+- Extract the intended target object from task first, then lock onto that target.
+- Do not switch to unrelated objects unless requested target is missing.
+- Speak calmly, clear, and actionable.
+- Use 2 to 3 complete sentences with natural cadence.
+- Use depth-informed cues when available: prioritize distance3d_m, xyz_m, depth_rel, fusion_w.
+- If scene_state.hand.visible is true, guide based on hand-to-target delta first (left/right/up/down/forward in small centimeters).
+- Use scene_state.dangerous_objects to prioritize at most one dangerous obstacle warning on current reach path.
+- Translate metric values to human-friendly cues for elderly users: clock direction (e.g., 2 o'clock), finger width, palm width, arm length.
+- Avoid technical units like degrees; use relative body-based language.
+- Include direction words from x/y and distance from z/d with concrete micro-motion magnitude.
+- If requested target is not visible: explicitly say it is not visible and give a short safe scan strategy.
+- Focus on one target only; mention at most one hazard.
+- If hazard overlaps target corridor in depth, explicitly warn and suggest narrower path.
+- If touch/contact is likely (very near hand-to-target), output a completion-style guidance: confirm contact, then gentle grasp and stop.
+- Avoid repeating previous_hint verbatim; rephrase naturally if scene is similar.
+- Use different sentence openings across consecutive hints.
+- Safety first: stop/caution when distance too near or collision risk.
+- Keep guidance coherent, no sentence fragments, no abrupt cutoff phrasing.
+- Output in clear English only.
+
+JSON schema:
+{{
+  "say": "short spoken guidance",
+  "target": "object name or unknown",
+  "distance_m": 0.0,
+  "direction": "left|right|center",
+  "confidence": 0.0,
+  "safety_note": "..."
+}}
+""".strip()

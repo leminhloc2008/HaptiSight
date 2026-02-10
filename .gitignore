@@ -1,0 +1,6 @@
+__pycache__/
+.torch_hub_cache/
+*.pt
+mobileclip_blt.ts
+*.log
+*.tmp
