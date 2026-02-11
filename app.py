@@ -47,7 +47,7 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.12"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-10-enact5-gemini-yolohand-opt3")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-11-enact6-grasp-agent-memory")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -201,6 +201,29 @@ def _dangerous_object_type(name: str) -> str:
 
 def _is_dangerous_object_name(name: str) -> bool:
     return bool(_dangerous_object_type(name))
+
+
+RISK_SCORE_PRIOR: Dict[str, float] = {
+    "knife": 1.00,
+    "scissors": 0.92,
+    "glass": 0.82,
+    "oven": 0.90,
+    "microwave": 0.72,
+    "toaster": 0.68,
+    "fire": 1.00,
+    "hot cup": 0.78,
+}
+
+
+def _risk_score_for_object(name: str, danger_type: str = "") -> float:
+    dt = _norm_label(danger_type)
+    nm = _norm_label(name)
+    if dt in RISK_SCORE_PRIOR:
+        return float(RISK_SCORE_PRIOR[dt])
+    for k, v in RISK_SCORE_PRIOR.items():
+        if k in nm:
+            return float(v)
+    return 0.18
 
 
 def _parse_class_prompt_text(class_prompt: str) -> List[str]:
@@ -535,6 +558,8 @@ class RealtimeEngine:
         self.active_prompt_classes: Optional[Tuple[str, ...]] = None
         self.active_prompt_error: Optional[str] = None
         self.prompt_fp32_active = False
+        self.prompt_fail_streak = 0
+        self.prompt_retry_after_ts = 0.0
         self.color_cache: Dict[str, Tuple[int, int, int]] = {}
         self._load_detector()
         self.distance_cache: Dict[str, float] = {}
@@ -831,6 +856,8 @@ class RealtimeEngine:
         self.active_prompt_classes = None
         self.active_prompt_error = None
         self.prompt_fp32_active = False
+        self.prompt_fail_streak = 0
+        self.prompt_retry_after_ts = 0.0
 
     @staticmethod
     def _parse_prompt_classes(class_prompt: str) -> List[str]:
@@ -859,10 +886,19 @@ class RealtimeEngine:
         if not classes:
             if self.active_prompt_classes is not None:
                 self._load_detector()
+            self.prompt_fail_streak = 0
+            self.prompt_retry_after_ts = 0.0
             return None
 
         cls_tuple = tuple(classes)
+        now_ts = time.time()
         if self.active_prompt_classes == cls_tuple and self.active_prompt_error is None:
+            return self.active_prompt_error
+        if (
+            self.active_prompt_classes == cls_tuple
+            and self.active_prompt_error is not None
+            and now_ts < float(self.prompt_retry_after_ts)
+        ):
             return self.active_prompt_error
 
         assert self.model is not None
@@ -891,11 +927,16 @@ class RealtimeEngine:
             self.names = self._names_to_dict(getattr(self.model, "names", classes))
             self.active_prompt_classes = cls_tuple
             self.active_prompt_error = None
+            self.prompt_fail_streak = 0
+            self.prompt_retry_after_ts = 0.0
         except Exception as exc:
             # Preserve error for UI stats, and allow retry on next calls.
             err_msg = f"Cannot set YOLOE prompt classes: {exc}"
             self.active_prompt_classes = cls_tuple
             self.active_prompt_error = err_msg
+            self.prompt_fail_streak += 1
+            cooldown = min(12.0, 2.0 + 1.6 * float(self.prompt_fail_streak))
+            self.prompt_retry_after_ts = time.time() + cooldown
             # Keep detector usable even if prompt embedding setup fails.
             try:
                 self._load_detector()
@@ -1784,6 +1825,9 @@ class RealtimeGuidanceWorker:
         self._task_complete_until_ts = 0.0
         self._hint_history = deque(maxlen=max(3, int(GUIDE_SAY_HISTORY)))
         self._norm_history = deque(maxlen=max(3, int(GUIDE_SAY_HISTORY)))
+        self._scene_memory_layout: Dict[str, Dict[str, float]] = {}
+        self._scene_memory_last_note = ""
+        self._scene_memory_last_ts = 0.0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1943,6 +1987,87 @@ class RealtimeGuidanceWorker:
         }
         return json.dumps(sig, ensure_ascii=True, sort_keys=True)
 
+    def _update_scene_memory(self, scene_state: Dict[str, Any]) -> str:
+        if not isinstance(scene_state, dict):
+            return ""
+        objects = scene_state.get("objects") or []
+        if not isinstance(objects, list) or not objects:
+            return ""
+        now = time.time()
+        current: Dict[str, Dict[str, float]] = {}
+        for obj in objects[:12]:
+            if not isinstance(obj, dict):
+                continue
+            name_raw = str(obj.get("name", "")).strip()
+            if not name_raw:
+                continue
+            name = _canonical_target_name(name_raw) or _norm_label(name_raw) or name_raw.lower()
+            x, y, z, d, conf = _obj_pose(obj)
+            entry = {"x": float(x), "y": float(y), "z": float(z), "d": float(d), "conf": float(conf)}
+            prev = current.get(name)
+            if prev is None or entry["d"] < prev["d"]:
+                current[name] = entry
+        if not current:
+            return ""
+
+        note = ""
+        if not self._scene_memory_layout:
+            self._scene_memory_layout = {k: dict(v) for k, v in current.items()}
+            self._scene_memory_last_note = "Scene baseline saved for memory."
+            self._scene_memory_last_ts = now
+            return self._scene_memory_last_note
+
+        moved: List[Tuple[str, float]] = []
+        added: List[str] = []
+        removed: List[str] = []
+        for name, cur in current.items():
+            prev = self._scene_memory_layout.get(name)
+            if prev is None:
+                added.append(name)
+            else:
+                delta = float(
+                    np.sqrt(
+                        (cur["x"] - prev.get("x", 0.0)) ** 2
+                        + (cur["y"] - prev.get("y", 0.0)) ** 2
+                        + (cur["z"] - prev.get("z", 0.0)) ** 2
+                    )
+                )
+                if delta >= 0.18:
+                    moved.append((name, delta))
+        for name in list(self._scene_memory_layout.keys())[:16]:
+            if name not in current:
+                removed.append(name)
+
+        for name, cur in current.items():
+            prev = self._scene_memory_layout.get(name)
+            if prev is None:
+                self._scene_memory_layout[name] = dict(cur)
+            else:
+                a = 0.72
+                self._scene_memory_layout[name] = {
+                    "x": a * prev.get("x", cur["x"]) + (1.0 - a) * cur["x"],
+                    "y": a * prev.get("y", cur["y"]) + (1.0 - a) * cur["y"],
+                    "z": a * prev.get("z", cur["z"]) + (1.0 - a) * cur["z"],
+                    "d": a * prev.get("d", cur["d"]) + (1.0 - a) * cur["d"],
+                    "conf": max(prev.get("conf", 0.0), cur["conf"]),
+                }
+
+        if moved:
+            moved.sort(key=lambda x: x[1], reverse=True)
+            note = f"Scene update: {moved[0][0]} moved."
+        elif added:
+            note = f"Scene update: new {added[0]} detected."
+        elif removed:
+            note = f"Scene update: {removed[0]} is no longer visible."
+
+        if note:
+            self._scene_memory_last_note = note
+            self._scene_memory_last_ts = now
+            return note
+        if now - self._scene_memory_last_ts <= 6.0:
+            return self._scene_memory_last_note
+        return ""
+
     @staticmethod
     def _is_rate_limited_error(err_text: str) -> bool:
         e = str(err_text or "").lower()
@@ -2007,6 +2132,11 @@ class RealtimeGuidanceWorker:
                 "Touch reached.",
                 "Reach complete.",
             ],
+            "complete-grasp": [
+                "Grasp confirmed.",
+                "Object secured.",
+                "Hold stable.",
+            ],
         }
         choices = openers.get(phase_key, ["Update."])
         idx = int(time.time() * 10) % max(1, len(choices))
@@ -2041,6 +2171,11 @@ class RealtimeGuidanceWorker:
                 continue
 
             scene_sig = self._scene_signature(scene_state)
+            scene_state_runtime = dict(scene_state) if isinstance(scene_state, dict) else scene_state
+            if isinstance(scene_state_runtime, dict):
+                mem_note = self._update_scene_memory(scene_state_runtime)
+                if mem_note:
+                    scene_state_runtime["scene_memory_note"] = mem_note
             gemini_interval_sec = max(float(interval_sec), float(GUIDE_GEMINI_MIN_INTERVAL_SEC))
             guidance = None
             model_used = "local-realtime"
@@ -2073,7 +2208,7 @@ class RealtimeGuidanceWorker:
                     t0 = time.perf_counter()
                     result = planner.guide_realtime(
                         user_query=str(cfg.get("query", "")),
-                        scene_state=scene_state,
+                        scene_state=scene_state_runtime,
                         profile_name=str(cfg.get("profile", "Realtime")),
                         fov_deg=CAM_FOV_DEG,
                         previous_hint=prev_hint,
@@ -2110,12 +2245,13 @@ class RealtimeGuidanceWorker:
                 locked_target = self._target_lock_name if now < self._target_lock_until_ts else ""
                 guidance = _build_local_realtime_guidance(
                     user_query=str(cfg.get("query", "")),
-                    scene_state=scene_state,
+                    scene_state=scene_state_runtime,
                     previous_hint=prev_hint,
                     locked_target=locked_target,
                     depth_informed=bool(cfg.get("depth_informed", True)),
+                    language=str(cfg.get("voice_lang", "en-US")),
                 )
-            scene_summary, scene_lines = _scene_detail_for_ui(scene_state)
+            scene_summary, scene_lines = _scene_detail_for_ui(scene_state_runtime)
             guidance["scene_summary"] = guidance.get("scene_summary") or scene_summary
             guidance["scene_lines"] = guidance.get("scene_lines") or scene_lines
             guidance["budget_note"] = budget_note
@@ -2541,6 +2677,47 @@ def _bbox_iou_xyxy(a: Optional[List[float]], b: Optional[List[float]]) -> float:
     return float(inter / union)
 
 
+def _bbox_area_xyxy(bbox: Optional[List[float]]) -> float:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return 0.0
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
+
+
+def _bbox_center_xyxy(bbox: Optional[List[float]]) -> Optional[Tuple[float, float]]:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    return float(0.5 * (x1 + x2)), float(0.5 * (y1 + y2))
+
+
+def _bbox_overlap_on_smaller(a: Optional[List[float]], b: Optional[List[float]]) -> float:
+    if not isinstance(a, (list, tuple)) or not isinstance(b, (list, tuple)) or len(a) < 4 or len(b) < 4:
+        return 0.0
+    ax1, ay1, ax2, ay2 = [float(v) for v in a[:4]]
+    bx1, by1, bx2, by2 = [float(v) for v in b[:4]]
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = _bbox_area_xyxy(a)
+    area_b = _bbox_area_xyxy(b)
+    base = max(1e-6, min(area_a, area_b))
+    return float(inter / base)
+
+
+def _point_in_bbox(px: float, py: float, bbox: Optional[List[float]]) -> bool:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return False
+    x1, y1, x2, y2 = [float(v) for v in bbox[:4]]
+    return (x1 <= float(px) <= x2) and (y1 <= float(py) <= y2)
+
+
 def _distance_point_to_segment_xy(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
     abx = bx - ax
     aby = by - ay
@@ -2688,6 +2865,7 @@ def _build_local_realtime_guidance(
     previous_hint: str = "",
     locked_target: str = "",
     depth_informed: bool = True,
+    language: str = "en-US",
 ) -> Dict[str, Any]:
     scene_summary, scene_lines = _scene_detail_for_ui(scene_state)
     objects = [o for o in ((scene_state or {}).get("objects") or []) if isinstance(o, dict)]
@@ -2695,6 +2873,12 @@ def _build_local_realtime_guidance(
     dangerous_objects = (scene_state or {}).get("dangerous_objects") or []
     if not isinstance(dangerous_objects, list):
         dangerous_objects = []
+    scene_memory_note = str((scene_state or {}).get("scene_memory_note", "")).strip()
+    is_vi = str(language or "").lower().startswith("vi")
+
+    def _txt(en_text: str, vi_text: str) -> str:
+        return vi_text if is_vi else en_text
+
     hand_visible = bool(isinstance(hand_state, dict) and hand_state.get("visible", False))
     hand_xyz: Optional[Tuple[float, float, float]] = None
     hand_distance_m = None
@@ -2718,10 +2902,12 @@ def _build_local_realtime_guidance(
         out["hand_distance_m"] = round(float(hand_distance_m), 3) if hand_distance_m is not None else None
         out["hand_to_target_m"] = out.get("hand_to_target_m", None)
         out["contact_detected"] = bool(out.get("contact_detected", False))
+        out["grasp_detected"] = bool(out.get("grasp_detected", False))
         out["target_xyz_m"] = out.get("target_xyz_m", None)
         out["danger_count"] = len(dangerous_objects)
         out["primary_danger"] = out.get("primary_danger", None)
         out["corridor_blocked"] = bool(out.get("corridor_blocked", False))
+        out["scene_memory_note"] = scene_memory_note
         return out
 
     requested_targets = _extract_requested_targets(user_query, "")
@@ -2729,18 +2915,32 @@ def _build_local_realtime_guidance(
     if not objects or focus_obj is None:
         requested_txt = target_hint if target_hint and target_hint != "unknown" else "target"
         variants = [
-            f"I cannot see {requested_txt} yet. Keep your hand still and scan the camera slowly from left to right.",
-            f"{requested_txt} is not visible now. Pause at center for one second, then continue a gentle side scan.",
-            f"I am still searching for {requested_txt}. Keep your wrist steady and sweep horizontally at a slow pace.",
+            _txt(
+                f"I cannot see {requested_txt} yet. Keep your hand still and scan the camera slowly from left to right.",
+                f"Chua thay {requested_txt}. Giu tay yen va quet camera cham tu trai sang phai.",
+            ),
+            _txt(
+                f"{requested_txt} is not visible now. Pause at center for one second, then continue a gentle side scan.",
+                f"Van chua thay {requested_txt}. Dung 1 giay o giua roi quet nhe hai ben.",
+            ),
+            _txt(
+                f"I am still searching for {requested_txt}. Keep your wrist steady and sweep horizontally at a slow pace.",
+                f"He thong dang tim {requested_txt}. Giu co tay on dinh va lia ngang that cham.",
+            ),
         ]
         if hand_visible:
             variants.append(
-                f"{requested_txt} is not visible yet. Keep your hand inside the camera view and scan slowly left to right."
+                _txt(
+                    f"{requested_txt} is not visible yet. Keep your hand inside the camera view and scan slowly left to right.",
+                    f"Chua thay {requested_txt}. Giu tay trong khung hinh va quet cham tu trai sang phai.",
+                )
             )
         idx = int(time.time()) % len(variants)
         say = variants[idx]
         if previous_hint and _text_similarity(_normalize_guide_text(previous_hint), _normalize_guide_text(say)) > 0.92:
             say = variants[(idx + 1) % len(variants)]
+        if scene_memory_note:
+            say = _sanitize_guide_text(f"{say} {scene_memory_note}")
         return _base_fields({
             "say": say,
             "target": requested_txt,
@@ -2749,23 +2949,41 @@ def _build_local_realtime_guidance(
             "clock_direction": "12 o'clock",
             "distance_human": "unknown",
             "confidence": 0.35 if requested_targets else 0.2,
-            "safety_note": "Stop if uncertain. Keep fingers open while searching.",
+            "safety_note": _txt("Stop if uncertain. Keep fingers open while searching.", "Neu khong chac, dung lai. Mo cac ngon tay trong luc tim."),
             "scene_summary": scene_summary,
             "scene_lines": scene_lines,
             "phase": "search",
             "depth_mode": "off",
             "depth_reliability": 0.0,
             "depth_note": "Depth guidance waiting for target visibility.",
+            "intent_agent": {"task": user_query or "Reach target", "target_object": requested_txt, "confidence": 0.28},
+            "spatial_agent": {"target_visible": False, "target_xyz_m": [0.0, 0.0, 0.0], "target_distance_m": -1.0, "recommended_approach": "Slow scan left-center-right."},
+            "safety_agent": {"risk_level": "medium", "hazards": ["Target not visible."], "collision_objects": [], "safety_score": 0.5},
+            "path_agent": {
+                "phase": "search",
+                "micro_steps": [
+                    _txt("Center camera.", "Canh giua camera."),
+                    _txt("Sweep slowly left to right.", "Quet cham trai sang phai."),
+                    _txt("Stop and re-center when target appears.", "Dung lai va canh giua khi vat the xuat hien."),
+                ],
+                "adaptive_voice_cadence_sec": 2.2,
+            },
         })
 
     if requested_targets and not target_visible:
         requested_txt = target_hint if target_hint else requested_targets[0]
         visible_names = [str(o.get("name", "")) for o in objects[:4] if str(o.get("name", "")).strip()]
         seen_note = f" I currently see: {', '.join(visible_names[:3])}." if visible_names else ""
-        say = (
-            f"I cannot confirm {requested_txt} yet.{seen_note} "
-            f"Scan slowly and keep the camera centered on your workspace."
-        ).strip()
+        say = _txt(
+            (
+                f"I cannot confirm {requested_txt} yet.{seen_note} "
+                f"Scan slowly and keep the camera centered on your workspace."
+            ).strip(),
+            (
+                f"Toi chua xac nhan duoc {requested_txt}.{seen_note} "
+                f"Hay quet cham va giu camera o giua ban."
+            ).strip(),
+        )
         return _base_fields({
             "say": _sanitize_guide_text(say),
             "target": requested_txt,
@@ -2774,13 +2992,25 @@ def _build_local_realtime_guidance(
             "clock_direction": "12 o'clock",
             "distance_human": "unknown",
             "confidence": 0.45,
-            "safety_note": "Requested object is not visible. Avoid reaching forward until it appears.",
+            "safety_note": _txt("Requested object is not visible. Avoid reaching forward until it appears.", "Vat the yeu cau chua xuat hien. Khong voi tay toi truoc khi thay ro."),
             "scene_summary": scene_summary,
             "scene_lines": scene_lines,
             "phase": "search-target",
             "depth_mode": "off",
             "depth_reliability": 0.0,
             "depth_note": "Depth-informed path is paused until requested target appears.",
+            "intent_agent": {"task": user_query or "Reach target", "target_object": requested_txt, "confidence": 0.42},
+            "spatial_agent": {"target_visible": False, "target_xyz_m": [0.0, 0.0, 0.0], "target_distance_m": -1.0, "recommended_approach": "Search while keeping hand still."},
+            "safety_agent": {"risk_level": "medium", "hazards": ["Requested target missing."], "collision_objects": visible_names[:2], "safety_score": 0.52},
+            "path_agent": {
+                "phase": "search-target",
+                "micro_steps": [
+                    _txt("Keep hand still.", "Giu tay dung yen."),
+                    _txt("Scan workspace left-center-right.", "Quet khong gian trai-giua-phai."),
+                    _txt("Resume reach only when target is visible.", "Chi tiep tuc voi tay khi thay ro muc tieu."),
+                ],
+                "adaptive_voice_cadence_sec": 2.0,
+            },
         })
 
     target = str(focus_obj.get("name") or target_hint or "target")
@@ -2802,14 +3032,46 @@ def _build_local_realtime_guidance(
     target_bbox = focus_obj.get("bbox_xyxy", None) if isinstance(focus_obj, dict) else None
     hand_bbox = hand_state.get("bbox_xyxy", None) if isinstance(hand_state, dict) else None
     hand_target_iou = _bbox_iou_xyxy(hand_bbox, target_bbox)
-    contact_detected = bool(
+    hand_target_overlap = _bbox_overlap_on_smaller(hand_bbox, target_bbox)
+    target_center = _bbox_center_xyxy(target_bbox)
+    hand_center = _bbox_center_xyxy(hand_bbox)
+    center_hit = False
+    center_norm = 10.0
+    if hand_center is not None and target_bbox is not None:
+        center_hit = _point_in_bbox(hand_center[0], hand_center[1], target_bbox)
+    if target_center is not None and hand_bbox is not None:
+        center_hit = bool(center_hit or _point_in_bbox(target_center[0], target_center[1], hand_bbox))
+    if hand_center is not None and target_center is not None:
+        center_dist_px = float(np.sqrt((hand_center[0] - target_center[0]) ** 2 + (hand_center[1] - target_center[1]) ** 2))
+        target_diag = float(np.sqrt(max(_bbox_area_xyxy(target_bbox), 1.0)))
+        center_norm = center_dist_px / max(8.0, 0.55 * target_diag)
+
+    depth_near = bool(hand_to_target_m is not None and hand_to_target_m <= max(float(HAND_CONTACT_DIST_M) * 1.35, 0.075))
+    reach_near = bool(hand_to_target_m is not None and hand_to_target_m <= max(float(HAND_TARGET_REACH_M) * 1.30, 0.16))
+    contact_score = 0.0
+    if depth_near:
+        contact_score += 0.42
+    if center_hit:
+        contact_score += 0.27
+    contact_score += 0.24 * float(np.clip(hand_target_overlap / 0.35, 0.0, 1.0))
+    contact_score += 0.18 * float(np.clip(hand_target_iou / 0.28, 0.0, 1.0))
+    if center_norm < 0.65:
+        contact_score += 0.13
+    if reach_near:
+        contact_score += 0.08
+    if hand_to_target_m is not None and hand_to_target_m > 0.22:
+        contact_score -= 0.18
+    contact_score = float(np.clip(contact_score, 0.0, 1.0))
+    contact_detected = bool(hand_visible and contact_score >= 0.62)
+    grasp_detected = bool(
         hand_visible
         and (
-            (hand_to_target_m is not None and hand_to_target_m <= float(HAND_CONTACT_DIST_M))
+            (contact_score >= 0.78 and hand_target_overlap >= 0.24)
             or (
-                hand_to_target_m is not None
-                and hand_to_target_m <= float(HAND_TARGET_REACH_M)
-                and hand_target_iou >= float(HAND_CONTACT_IOU)
+                contact_detected
+                and hand_to_target_m is not None
+                and hand_to_target_m <= max(0.045, float(HAND_CONTACT_DIST_M) * 0.85)
+                and hand_target_overlap >= 0.16
             )
         )
     )
@@ -2851,94 +3113,38 @@ def _build_local_realtime_guidance(
     elif vert != "center":
         direction_phrase = f"slightly {vert}"
 
-    variants: List[str] = []
-    if contact_detected:
-        phase = "complete-touch"
-        variants = [
-            f"Touch confirmed on {target}. Keep your hand steady, close your fingers now, and lift slowly.",
-            f"You have reached {target}. Gentle grip now. Keep your wrist stable before lifting.",
-        ]
-    elif hand_visible and hand_to_target_m is not None:
-        h_horiz = "left" if dxh < -0.04 else ("right" if dxh > 0.04 else "center")
-        h_vert = "up" if dyh < -0.04 else ("down" if dyh > 0.04 else "center")
-        h_forward = "forward" if dzh > 0.035 else ("back a little" if dzh < -0.035 else "hold depth")
-        hand_side_cm = abs(dxh) * 100.0
-        hand_vertical_cm = abs(dyh) * 100.0
-        hand_forward_cm = abs(dzh) * 100.0
-        side_step = _cm_to_body_step(hand_side_cm)
-        vert_step = _cm_to_body_step(hand_vertical_cm)
-        fwd_step = _cm_to_body_step(hand_forward_cm)
+    h_horiz = "left" if dxh < -0.04 else ("right" if dxh > 0.04 else "center")
+    h_vert = "up" if dyh < -0.04 else ("down" if dyh > 0.04 else "center")
+    h_forward = "forward" if dzh > 0.035 else ("back a little" if dzh < -0.035 else "hold depth")
+    hand_side_cm = abs(dxh) * 100.0
+    hand_vertical_cm = abs(dyh) * 100.0
+    hand_forward_cm = abs(dzh) * 100.0
+    side_step = _cm_to_body_step(hand_side_cm)
+    vert_step = _cm_to_body_step(hand_vertical_cm)
+    fwd_step = _cm_to_body_step(hand_forward_cm)
 
-        if hand_to_target_m > 0.45:
+    if grasp_detected:
+        phase = "complete-grasp"
+    elif contact_detected:
+        phase = "complete-touch"
+    elif hand_visible and hand_to_target_m is not None:
+        if hand_to_target_m > 0.42:
             phase = "orientation"
-            variants = [
-                f"{target} is at {clock_direction}, {distance_human}. Turn your hand toward {clock_direction}, then move forward slowly.",
-                (
-                    f"Start with coarse alignment. Move {h_horiz} {side_step} and {h_vert} {vert_step}, "
-                    f"then go {h_forward} {fwd_step}."
-                ),
-            ]
-        elif hand_to_target_m > 0.14:
+        elif hand_to_target_m > 0.18:
             phase = "approach"
-            variants = [
-                (
-                    f"Good approach. Move {h_horiz} {side_step}, adjust {h_vert} {vert_step}, "
-                    f"then go {h_forward} {fwd_step}."
-                ),
-                f"{target} is near at {clock_direction}. Keep motion compact and advance with short, smooth pushes.",
-            ]
-        elif hand_to_target_m > float(HAND_CONTACT_DIST_M):
+        elif hand_to_target_m > max(float(HAND_CONTACT_DIST_M) * 1.2, 0.08):
             phase = "fine-tuning"
-            variants = [
-                (
-                    f"Very close now. Shift {h_horiz} {side_step}, lower or raise {vert_step}, "
-                    f"then nudge {h_forward}."
-                ),
-                f"Finger-zone guidance: tiny correction only, then gently touch {target}.",
-            ]
         else:
             phase = "grasp"
-            variants = [
-                f"{target} is in grasp range. Keep your palm vertical like a handshake, touch first, then close fingers.",
-                f"Final micro-step. Nudge forward a tiny bit, feel contact, then grip gently.",
-            ]
-        if hand_target_iou > 0.04 and phase in {"fine-tuning", "grasp"}:
-            variants.append(
-                "Your hand is aligned over the target area. Slow down and use only fingertip-sized motion."
-            )
     else:
         if d > 0.80:
             phase = "orientation"
-            variants = [
-                f"I see {target} at {clock_direction}, {distance_human}. Move your hand toward {clock_direction}.",
-                f"{target} is {direction_phrase}. Start broad alignment first, then approach slowly.",
-            ]
         elif d > 0.26:
             phase = "approach"
-            variants = [
-                f"{target} is now closer, still around {clock_direction}. Move forward with short controlled motion.",
-                f"Approach phase: {lateral_cmd}, then advance gently.",
-            ]
         else:
             phase = "fine-tuning"
-            variants = [
-                f"{target} is very near. Use tiny motion only and prepare to touch then grasp.",
-                f"Near-contact zone. Keep your hand steady and nudge forward little by little.",
-            ]
-        if hand_visible and hand_xyz is None:
-            variants.append(
-                "I can see your hand, but hand depth is still calibrating. Keep your hand centered in the camera view."
-            )
 
     key = f"{target}:{phase}:{horiz}:{vert}:{int(round(d * 10))}:{int(round(conf * 10))}"
-    idx = abs(hash(key)) % len(variants)
-    say = _sanitize_guide_text(variants[idx])
-
-    prev_norm = _normalize_guide_text(previous_hint)
-    curr_norm = _normalize_guide_text(say)
-    if _text_similarity(prev_norm, curr_norm) > 0.92:
-        say = _sanitize_guide_text(variants[(idx + 1) % len(variants)])
-
     primary_danger = _pick_primary_danger(dangerous_objects, hand_xyz, target_xyz)
     hazard = primary_danger
     if hazard is None:
@@ -2947,9 +3153,13 @@ def _build_local_realtime_guidance(
             hazard = _pick_primary_hazard(focus_obj, objects)
     collision_note = ""
     hazard_prefix = ""
+    hazard_name = ""
+    hazard_level = "low"
+    hazard_penalty = 0.0
     corridor_blocked = False
     if hazard is not None:
         hname = str(hazard.get("name", "object"))
+        hazard_name = hname
         hx, _, _, hd, _ = _obj_pose(hazard)
         hxyz = hazard.get("xyz_m", [0.0, 0.0, 0.0]) if isinstance(hazard, dict) else [0.0, 0.0, 0.0]
         if isinstance(hxyz, (list, tuple)) and len(hxyz) >= 3 and hand_xyz is not None:
@@ -2964,30 +3174,170 @@ def _build_local_realtime_guidance(
         side = "left" if hx < x else "right"
         depth_gap_cm = int(round((hd - d) * 100.0))
         danger_level = str(hazard.get("level", "")).lower()
+        hazard_level = danger_level or "medium"
+        hazard_penalty = float(_risk_score_for_object(hname, str(hazard.get("danger_type", ""))))
         if corridor_blocked:
-            hazard_prefix = (
-                f"Caution, dangerous {hname} is on your current reach corridor. "
-                "Pause, move your hand slightly away from it, then continue with a narrow straight path. "
+            hazard_prefix = _txt(
+                (
+                    f"Caution, dangerous {hname} is on your current reach corridor. "
+                    "Pause, move your hand slightly away from it, then continue with a narrow straight path. "
+                ),
+                (
+                    f"Canh bao, {hname} nguy hiem dang nam tren duong voi tay. "
+                    "Tam dung, ne tay sang ben nhe roi di tiep theo duong hep va thang. "
+                ),
             )
         elif depth_gap_cm <= -4:
-            hazard_prefix = (
-                f"Caution, {hname} is in front of {target} by about {abs(depth_gap_cm)} centimeters. "
-                "Narrow your approach path. "
+            hazard_prefix = _txt(
+                (
+                    f"Caution, {hname} is in front of {target} by about {abs(depth_gap_cm)} centimeters. "
+                    "Narrow your approach path. "
+                ),
+                (
+                    f"Canh bao, {hname} nam truoc {target} khoang {abs(depth_gap_cm)} cm. "
+                    "Thu hep duong di cua tay. "
+                ),
             )
         elif depth_gap_cm >= 4:
-            hazard_prefix = (
-                f"Caution, {hname} is just behind {target}. Slow down before final reach. "
+            hazard_prefix = _txt(
+                f"Caution, {hname} is just behind {target}. Slow down before final reach. ",
+                f"Canh bao, {hname} nam sau {target}. Giam toc truoc buoc cuoi.",
             )
         else:
-            hazard_prefix = f"Caution, {hname} is on your {side} side near the reach path. "
+            hazard_prefix = _txt(
+                f"Caution, {hname} is on your {side} side near the reach path. ",
+                f"Canh bao, {hname} nam ben {side} gan duong voi tay.",
+            )
         if danger_level == "high":
-            hazard_prefix = f"{hazard_prefix}This is a high-risk object. "
+            hazard_prefix = _txt(
+                f"{hazard_prefix}This is a high-risk object. ",
+                f"{hazard_prefix}Day la vat co rui ro cao. ",
+            )
         collision_note = (
-            f" Obstacle alert: {hname} is near your {side} path at about {hd:.2f} meters. "
-            "Keep motion narrow and avoid sweeping."
+            _txt(
+                f" Obstacle alert: {hname} is near your {side} path at about {hd:.2f} meters. Keep motion narrow and avoid sweeping.",
+                f" Canh bao va cham: {hname} dang gan duong {side} cua tay, cach khoang {hd:.2f} m. Di tay hep va tranh quat ngang.",
+            )
         )
-        if hazard_prefix:
-            say = _sanitize_guide_text(f"{hazard_prefix}{say}")
+
+    cadence_sec = 2.2
+    if phase == "orientation":
+        cadence_sec = 2.2
+    elif phase == "approach":
+        cadence_sec = 1.6
+    elif phase == "fine-tuning":
+        cadence_sec = 1.0
+    elif phase in {"grasp", "complete-touch"}:
+        cadence_sec = 0.85
+    elif phase == "complete-grasp":
+        cadence_sec = 2.5
+
+    variants: List[str] = []
+    if phase == "complete-grasp":
+        variants = [
+            _txt(
+                f"{target} is secured in your hand. Hold steady, keep it upright, and move back slowly.",
+                f"Ban da nam chac {target}. Giu on dinh, giu vat dung va rut tay lai cham.",
+            ),
+            _txt(
+                f"Grasp confirmed on {target}. Keep your wrist stable and lift straight up gently.",
+                f"Da xac nhan nam {target}. Giu co tay on dinh va nhac len thang nhe nhang.",
+            ),
+        ]
+    elif phase == "complete-touch":
+        variants = [
+            _txt(
+                f"Contact confirmed on {target}. Close your fingers gently now, then lift a little.",
+                f"Da cham vao {target}. Khep ngon tay nhe ngay bay gio roi nhac len mot chut.",
+            ),
+            _txt(
+                f"You touched {target}. Keep your palm vertical, wrap fingers around it, then hold.",
+                f"Ban da cham {target}. Giu long ban tay dung, om quanh vat roi giu chac.",
+            ),
+        ]
+    elif phase == "grasp":
+        variants = [
+            _txt(
+                f"Final micro-step. Move {h_horiz} {side_step}, {h_vert} {vert_step}, then nudge {h_forward} and feel contact.",
+                f"Buoc vi chinh cuoi. Dua tay {h_horiz} {side_step}, {h_vert} {vert_step}, roi nhich {h_forward} de cham vat.",
+            ),
+            _txt(
+                f"{target} is in grasp range. Keep palm vertical like a handshake, tiny forward nudge, then close fingers.",
+                f"{target} da vao tam nam. Giu long ban tay dung nhu bat tay, nhich toi rat nhe roi khep ngon tay.",
+            ),
+        ]
+    elif phase == "fine-tuning":
+        variants = [
+            _txt(
+                f"Very close now. Shift {h_horiz} {side_step}, adjust {h_vert} {vert_step}, and move {h_forward} only a tiny bit.",
+                f"Da rat gan. Dich {h_horiz} {side_step}, chinh {h_vert} {vert_step}, va di {h_forward} that nhe.",
+            ),
+            _txt(
+                f"Precision step: keep your wrist soft, tiny correction to center, then advance fingertip by fingertip.",
+                f"Buoc chinh xac: tha long co tay, chinh nhe ve giua, roi tien toi tung chut theo dau ngon tay.",
+            ),
+        ]
+    elif phase == "approach":
+        variants = [
+            _txt(
+                f"Good approach. Keep moving in direction {clock_direction}. Move {h_horiz} {side_step}, then {h_forward} {fwd_step}.",
+                f"Tiep can tot. Giu huong {clock_direction}. Dua tay {h_horiz} {side_step}, roi {h_forward} {fwd_step}.",
+            ),
+            _txt(
+                f"{target} is around {distance_human}. Keep motion smooth and short, avoid wide side sweep.",
+                f"{target} cach {distance_human}. Di tay ngan, deu, tranh quat ngang rong.",
+            ),
+        ]
+    else:
+        variants = [
+            _txt(
+                f"{target} is at {clock_direction}, {distance_human}. Start broad alignment first, then move forward slowly.",
+                f"{target} o huong {clock_direction}, cach {distance_human}. Canh huong rong truoc, roi tien toi cham.",
+            ),
+            _txt(
+                f"Orientation phase. Keep camera centered, align your hand to {clock_direction}, then advance with short pushes.",
+                f"Giai doan dinh huong. Giu camera o giua, dua tay theo {clock_direction}, roi day toi tung doan ngan.",
+            ),
+        ]
+        if hand_visible and hand_xyz is None:
+            variants.append(
+                _txt(
+                    "I can see your hand, but hand depth is still calibrating. Keep your hand centered in camera view.",
+                    "Toi thay tay ban nhung do sau cua tay dang hieu chinh. Hay giu tay o giua khung hinh.",
+                )
+            )
+
+    if hazard_prefix:
+        variants = [_sanitize_guide_text(f"{hazard_prefix}{v}") for v in variants]
+    if scene_memory_note and phase in {"orientation", "approach"}:
+        variants.append(_sanitize_guide_text(f"{variants[0]} {scene_memory_note}"))
+
+    idx = abs(hash(key)) % max(1, len(variants))
+    say = _sanitize_guide_text(variants[idx])
+    prev_norm = _normalize_guide_text(previous_hint)
+    curr_norm = _normalize_guide_text(say)
+    if _text_similarity(prev_norm, curr_norm) > 0.92 and len(variants) > 1:
+        say = _sanitize_guide_text(variants[(idx + 1) % len(variants)])
+
+    micro_steps = [
+        _txt(f"Align hand toward {clock_direction}.", f"Canh tay theo huong {clock_direction}."),
+        _txt(f"Move {h_horiz} {side_step} and {h_vert} {vert_step}.", f"Dich tay {h_horiz} {side_step} va {h_vert} {vert_step}."),
+        _txt(f"Advance {h_forward} {fwd_step}.", f"Tien tay {h_forward} {fwd_step}."),
+    ]
+    if hazard_name:
+        micro_steps.insert(
+            0,
+            _txt(
+                f"Avoid {hazard_name}; keep a narrow path.",
+                f"Ne {hazard_name}; giu duong di hep.",
+            ),
+        )
+    if phase in {"complete-touch", "complete-grasp"}:
+        micro_steps = [
+            _txt("Hold wrist steady.", "Giu co tay on dinh."),
+            _txt("Close fingers gently around target.", "Khep ngon tay nhe quanh vat."),
+            _txt("Lift straight up slowly.", "Nang thang len cham."),
+        ]
 
     conf_out = float(np.clip(conf, 0.0, 1.0))
     if depth_available:
@@ -2998,6 +3348,15 @@ def _build_local_realtime_guidance(
         conf_out = float(np.clip(conf_out + 0.05, 0.0, 1.0))
     if contact_detected:
         conf_out = float(np.clip(conf_out + 0.08, 0.0, 1.0))
+    if grasp_detected:
+        conf_out = float(np.clip(conf_out + 0.06, 0.0, 1.0))
+
+    safety_score = float(np.clip(1.0 - (0.55 * hazard_penalty + (0.25 if corridor_blocked else 0.0)), 0.05, 1.0))
+    risk_level = "low"
+    if corridor_blocked or hazard_level == "high" or safety_score < 0.45:
+        risk_level = "high"
+    elif hazard_name or safety_score < 0.70:
+        risk_level = "medium"
 
     primary_danger_out = None
     if isinstance(primary_danger, dict):
@@ -3014,6 +3373,36 @@ def _build_local_realtime_guidance(
             "corridor_blocked": bool(corridor_blocked),
         }
 
+    intent_agent = {
+        "task": user_query or f"Reach {target}",
+        "target_object": target,
+        "confidence": round(float(0.55 + 0.35 * conf_out), 2),
+    }
+    spatial_agent = {
+        "target_visible": True,
+        "target_xyz_m": [round(float(target_xyz[0]), 3), round(float(target_xyz[1]), 3), round(float(target_xyz[2]), 3)],
+        "target_distance_m": round(float(d), 3),
+        "clock_direction": clock_direction,
+        "hand_to_target_m": round(float(hand_to_target_m), 3) if hand_to_target_m is not None else None,
+        "recommended_approach": f"{phase} via {clock_direction}",
+    }
+    safety_agent = {
+        "risk_level": risk_level,
+        "hazards": ([hazard_name] if hazard_name else []),
+        "collision_objects": ([hazard_name] if corridor_blocked and hazard_name else []),
+        "safety_score": round(float(safety_score), 2),
+        "corridor_blocked": bool(corridor_blocked),
+    }
+    path_agent = {
+        "phase": phase,
+        "micro_steps": micro_steps[:4],
+        "stop_conditions": [
+            _txt("Unexpected hard contact.", "Cham manh bat ngo."),
+            _txt("Target leaves camera view.", "Mat muc tieu khoi khung hinh."),
+        ],
+        "adaptive_voice_cadence_sec": round(float(cadence_sec), 2),
+    }
+
     return _base_fields({
         "say": say,
         "target": target,
@@ -3022,7 +3411,10 @@ def _build_local_realtime_guidance(
         "clock_direction": clock_direction,
         "distance_human": distance_human,
         "confidence": round(conf_out, 2),
-        "safety_note": f"Move slowly and stop on unexpected contact.{collision_note}",
+        "safety_note": _txt(
+            f"Move slowly and stop on unexpected contact.{collision_note}",
+            f"Di tay cham va dung lai neu cham bat thuong.{collision_note}",
+        ),
         "scene_summary": scene_summary,
         "scene_lines": scene_lines,
         "phase": phase,
@@ -3031,9 +3423,17 @@ def _build_local_realtime_guidance(
         "depth_note": depth_note,
         "hand_to_target_m": round(float(hand_to_target_m), 3) if hand_to_target_m is not None else None,
         "contact_detected": bool(contact_detected),
+        "contact_score": round(float(contact_score), 3),
+        "grasp_detected": bool(grasp_detected),
+        "hand_target_iou": round(float(hand_target_iou), 3),
+        "hand_target_overlap": round(float(hand_target_overlap), 3),
         "target_xyz_m": [round(float(target_xyz[0]), 3), round(float(target_xyz[1]), 3), round(float(target_xyz[2]), 3)],
         "primary_danger": primary_danger_out,
         "corridor_blocked": bool(corridor_blocked),
+        "intent_agent": intent_agent,
+        "spatial_agent": spatial_agent,
+        "safety_agent": safety_agent,
+        "path_agent": path_agent,
     })
 
 
@@ -3044,11 +3444,17 @@ def _render_realtime_guidance_markdown(
     fallback_used: bool,
     error_message: str = "",
 ) -> str:
+    def _f(val: Any, default: float = 0.0) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return float(default)
+
     say = _sanitize_guide_text(str((guidance or {}).get("say", "")))
     target = str((guidance or {}).get("target", "unknown"))
-    distance_m = float((guidance or {}).get("distance_m", -1.0))
+    distance_m = _f((guidance or {}).get("distance_m", -1.0), -1.0)
     direction = str((guidance or {}).get("direction", "center"))
-    confidence = float((guidance or {}).get("confidence", 0.0))
+    confidence = _f((guidance or {}).get("confidence", 0.0), 0.0)
     safety_note = str((guidance or {}).get("safety_note", "")).strip()
     scene_summary = str((guidance or {}).get("scene_summary", "")).strip()
     scene_lines = (guidance or {}).get("scene_lines", [])
@@ -3058,7 +3464,7 @@ def _render_realtime_guidance_markdown(
     phase = str((guidance or {}).get("phase", "")).strip()
     depth_mode = str((guidance or {}).get("depth_mode", "")).strip()
     depth_note = str((guidance or {}).get("depth_note", "")).strip()
-    depth_reliability = float((guidance or {}).get("depth_reliability", 0.0))
+    depth_reliability = _f((guidance or {}).get("depth_reliability", 0.0), 0.0)
     guidance_style = str((guidance or {}).get("guidance_style", "enact")).strip()
     clock_direction = str((guidance or {}).get("clock_direction", "12 o'clock")).strip()
     distance_human = str((guidance or {}).get("distance_human", "")).strip()
@@ -3066,10 +3472,15 @@ def _render_realtime_guidance_markdown(
     hand_distance_m = (guidance or {}).get("hand_distance_m", None)
     hand_to_target_m = (guidance or {}).get("hand_to_target_m", None)
     contact_detected = bool((guidance or {}).get("contact_detected", False))
+    grasp_detected = bool((guidance or {}).get("grasp_detected", False))
+    contact_score = _f((guidance or {}).get("contact_score", 0.0), 0.0)
     hand_xyz_m = (guidance or {}).get("hand_xyz_m", None)
     danger_count = int((guidance or {}).get("danger_count", 0) or 0)
     primary_danger = (guidance or {}).get("primary_danger", None)
     corridor_blocked = bool((guidance or {}).get("corridor_blocked", False))
+    scene_memory_note = str((guidance or {}).get("scene_memory_note", "")).strip()
+    safety_agent = (guidance or {}).get("safety_agent", {})
+    path_agent = (guidance or {}).get("path_agent", {})
 
     lines = [
         f"Realtime guide: `{model_used}` | latency: `{latency_ms:.1f} ms` | fallback: `{fallback_used}`",
@@ -3091,16 +3502,22 @@ def _render_realtime_guidance_markdown(
     if hand_visible:
         hand_line = "Hand: `visible`"
         if hand_distance_m is not None:
-            hand_line += f" | distance: `{float(hand_distance_m):.2f} m`"
+            hand_line += f" | distance: `{_f(hand_distance_m):.2f} m`"
         if hand_to_target_m is not None:
-            hand_line += f" | hand->target: `{float(hand_to_target_m):.2f} m`"
+            hand_line += f" | hand->target: `{_f(hand_to_target_m):.2f} m`"
         if contact_detected:
             hand_line += " | contact: `yes`"
+        if grasp_detected:
+            hand_line += " | grasp: `yes`"
+        if contact_score > 0:
+            hand_line += f" | contact_score: `{contact_score:.2f}`"
         if isinstance(hand_xyz_m, (list, tuple)) and len(hand_xyz_m) >= 3:
-            hand_line += f" | xyz=(`{float(hand_xyz_m[0]):+.2f}`, `{float(hand_xyz_m[1]):+.2f}`, `{float(hand_xyz_m[2]):.2f}`)"
+            hand_line += f" | xyz=(`{_f(hand_xyz_m[0]):+.2f}`, `{_f(hand_xyz_m[1]):+.2f}`, `{_f(hand_xyz_m[2]):.2f}`)"
         lines.append(hand_line)
         if contact_detected:
             lines.append("Task status: `target touched`")
+        if grasp_detected:
+            lines.append("Task status: `target grasped`")
     else:
         lines.append("Hand: `not visible`")
     if danger_count > 0:
@@ -3113,10 +3530,24 @@ def _render_realtime_guidance_markdown(
             if dl:
                 danger_line += f" ({dl})"
             if dd is not None:
-                danger_line += f" @ `{float(dd):.2f} m`"
+                danger_line += f" @ `{_f(dd):.2f} m`"
         if corridor_blocked:
             danger_line += " | corridor: `blocked`"
         lines.append(danger_line)
+    if isinstance(safety_agent, dict):
+        risk_level = str(safety_agent.get("risk_level", "")).strip()
+        safety_score = safety_agent.get("safety_score", None)
+        if risk_level:
+            line = f"Safety agent: risk=`{risk_level}`"
+            if safety_score is not None:
+                line += f" | score=`{_f(safety_score):.2f}`"
+            lines.append(line)
+    if isinstance(path_agent, dict):
+        cadence = path_agent.get("adaptive_voice_cadence_sec", None)
+        if cadence is not None:
+            lines.append(f"Adaptive voice cadence: `{_f(cadence):.2f}s`")
+    if scene_memory_note:
+        lines.append(f"Scene memory: {scene_memory_note}")
     if scene_summary:
         lines.append(f"Scene: {scene_summary}")
     if scene_lines:
