@@ -30,7 +30,7 @@ except Exception:
     mp_hands = None
 
 ROOT = Path(__file__).resolve().parent
-YOLO_DIR = ROOT / "REAL-TIME_Distance_Estimation_with_YOLOV7"
+YOLO_DIR = ROOT / "distance_estimation_core"
 MAX_FRAME_EDGE = int(os.getenv("MAX_FRAME_EDGE", "448"))
 MAX_OUTPUT_EDGE = int(os.getenv("MAX_OUTPUT_EDGE", "320"))
 MAX_DEPTH_EDGE = int(os.getenv("MAX_DEPTH_EDGE", "256"))

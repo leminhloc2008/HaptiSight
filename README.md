@@ -1,5 +1,5 @@
 ---
-title: YOLOER V2 CPU Realtime
+title: YOLOER V2 Realtime Assist
 colorFrom: blue
 colorTo: green
 sdk: gradio
@@ -8,185 +8,76 @@ python_version: "3.10"
 pinned: false
 ---
 
-# YOLOER_V2
-YOLOER stands for You Only Look Once and Estimate Range. This Space version uses **YOLOE (THU-MIG)** for object detection, combined with MiDaS depth and 3D coordinate estimation for realtime CPU webcam inference.
+# HaptiSight / YOLOER V2 Realtime Assist
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HassanBinHaroon/YOLOER_V2/blob/master/YOLOER_V2.ipynb)
+Realtime assistive vision app for object reaching:
+- YOLOE detection (target-focused prompt classes supported)
+- MiDaS depth fusion for distance + 3D coordinates
+- Hand tracking + contact/grasp state estimation
+- Safety-aware guidance and voice output for realtime support
+- Deployable on Hugging Face Spaces (CPU) or Modal (GPU)
 
-## Hugging Face Spaces (CPU Realtime Webcam)
+## Project Structure
 
-This repo now includes a Spaces-ready Gradio app at `app.py`.
-The runtime engine uses adaptive detection scheduling (fast frames + periodic hi-res refresh) and asynchronous MiDaS updates to keep webcam output responsive on CPU.
+- `app.py`: main Gradio app and realtime inference pipeline
+- `smart_agent.py`: Gemini planning/realtime guidance client
+- `modal_app.py`: Modal deployment entrypoint
+- `distance_estimation_core/`: distance regression assets and legacy core utilities used by runtime
+- `requirements.txt`: dependencies
 
-## Modal Deployment (Alternative)
-
-You can deploy the same realtime Gradio app on Modal using `modal_app.py` with GPU.
-
-### 1) Install and login
-
-```bash
-pip install -U modal
-modal setup
-# or non-interactive:
-# modal token set --token-id <ID> --token-secret <SECRET>
-```
-
-### 2) Optional warmup (download model/cache once)
-
-```bash
-modal run modal_app.py::warmup
-```
-
-Optional benchmark (server-side compute FPS, excludes browser network latency):
-
-```bash
-modal run modal_app.py::benchmark
-```
-
-### 3) Deploy web app
-
-```bash
-modal deploy modal_app.py
-```
-
-After deploy, Modal returns a public URL for the ASGI app (`web` function).
-
-### 4) Optional runtime tuning (env)
-
-- `MODAL_GPU`: `A10G` (default), `L4`, `L40S`, `A100`, `H100`, `T4`
-- `YOLOE_MODEL_ID`: default `yoloe-11m` on GPU
-- `USE_FP16`: default `1`
-- `DEPTH_MODEL`: default `DPT_Hybrid` on GPU
-- `MAX_FRAME_EDGE`: default `640`
-- `MAX_OUTPUT_EDGE`: default `416`
-- `MAX_DEPTH_EDGE`: default `384`
-- `HIRES_REFRESH_EVERY`: default `3`
-- `FAST_SIZE_DELTA`: default `0`
-- `WEBCAM_CAPTURE_W`: default `640`
-- `WEBCAM_CAPTURE_H`: default `360`
-- `WEBCAM_CAPTURE_FPS`: default `24`
-
-### 1) Recommended detector for CPU realtime
-
-- Default: `YOLOE_MODEL_ID=yoloe-11s`
-- Fallback: `yoloe-v8s`
-- Custom checkpoint: set `YOLOE_WEIGHTS` to a local `.pt` path or URL.
-
-### 2) Space settings
-
-- Space SDK: `Gradio`
-- Hardware: `CPU` (Pro tier is fine)
-- Startup file: `app.py`
-- Python deps: root `requirements.txt`
-
-Optional environment variables:
-
-- `YOLOE_MODEL_ID`: model id, e.g. `yoloe-11s`, `yoloe-v8s`, `yoloe-v8m`
-- `YOLOE_WEIGHTS`: custom YOLOE `.pt` path (absolute or relative) or URL
-- `CPU_THREADS`: number of CPU threads for Torch (default: auto-tuned)
-- `HIRES_REFRESH_EVERY`: run hi-res detection every N frames (default: `6`)
-- `FAST_SIZE_DELTA`: reduce image size on fast frames (default: `64`)
-- `GEMINI_API_KEY`: key for Gemini smart multi-agent planner (optional)
-- `CAM_FOV_DEG`: camera horizontal FOV for XYZ projection (default: `70`)
-
-### 2.1) Smart Agent (Gemini)
-
-The app includes a Gemini-powered multi-agent planner for actionable guidance:
-
-- `query_reasoner`
-- `spatial_reasoner`
-- `safety_assessor`
-- `path_planner`
-
-This planner runs on-demand from UI button `Generate Smart Guidance (Gemini)` and consumes current realtime scene state (objects + fused depth distance + XYZ).
-
-For zero-cost operation:
-
-- Use Google AI Studio free-tier model (`gemini-2.0-flash-lite` / `gemini-1.5-flash`).
-- Keep calls on-demand only (not per-frame), as implemented in this app.
-
-### 3) Local run
+## Run Locally
 
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
 
-### 4) Push to Space
+Then open the Gradio URL shown in terminal.
+
+## Hugging Face Space
+
+Recommended:
+- SDK: `Gradio`
+- Startup file: `app.py`
+- Python deps: `requirements.txt`
+- Hardware: CPU (Pro tier recommended for better stability)
+
+Push to Space:
 
 ```bash
-git init
 git add .
-git commit -m "hf space app"
-git remote add origin https://huggingface.co/spaces/<YOUR_USER>/<SPACE_NAME>
-git push -u origin main
+git commit -m "deploy space"
+git push
 ```
 
-# Demo1 
+## Modal Deployment (GPU)
 
-![](https://github.com/HassanBinHaroon/YOLOER_V2/blob/master/demo/class_and_distance.gif)
+```bash
+pip install -U modal
+modal setup
+modal deploy modal_app.py
+```
 
-# Demo2
+Optional:
 
-![](https://github.com/HassanBinHaroon/YOLOER_V2/blob/master/demo/car.jpg)    
+```bash
+modal run modal_app.py::warmup
+modal run modal_app.py::benchmark
+```
 
-## Table of Contents
+## Important Environment Variables
 
- ### 1. Inference on Local Machine Webcam
- ### 2. Inference on Google Colab (quick start)
- ### 3. Training of Object Detector 
- ### 4. Training of Distance Estimator
+- `YOLOE_MODEL_ID`: detector model id (for example `yoloe-11s`, `yoloe-11m`)
+- `YOLOE_WEIGHTS`: custom `.pt` checkpoint path
+- `FORCE_CPU`: force CPU mode (`1` or `0`)
+- `CPU_THREADS`: torch CPU thread count
+- `DEPTH_MODEL`: `MiDaS_small` or `DPT_Hybrid`
+- `GEMINI_API_KEY`: Gemini API key (optional)
+- `HAND_DETECT_MODE`: `mediapipe`, `yoloe`, or `hybrid`
 
-## Inference on Local Machine Webcam
+## Runtime Notes
 
-In order to test any Real-Time system, the most convenient method is to run on the webcam. So, we provide the options of quick inference on a local machine and visualization through the webcam. Some installations are required before running the inference and the following subsection contains the entire method. So follow step by step. 
+- `30fps-stable` profile is tuned for smoother realtime behavior.
+- `Balanced` and `Precision` trade speed for higher depth/detail quality.
+- If browser voice is silent, click `Enable Camera Permission` or `Test Voice` once to unlock speech synthesis.
 
-Moreover, we prefer working in Conda environments and it is recommended to install it first. In case of not have Conda installed, just skip the Conda-specific commands and follow along.  
-
-### Installation Procedure
-
-#### Step 1
-
-     conda create --name YOLOER_V2 python=3.7 -y && conda activate YOLOER_V2
-
-#### Step 2
-
-     git clone https://github.com/HassanBinHaroon/YOLOER_V2.git
-
-#### Step 3
-
-     cd YOLOER_V2/REAL-TIME_Distance_Estimation_with_YOLOV7
-     
-#### Step 4     
-
-     pip install -r requirements.txt
-     
-#### Step 5     
-
-     python detect.py --save-txt --weights yolov7.pt --conf 0.4 --source 0 --model_dist model@1535470106.json --weights_dist model@1535470106.h5 
-
-## Inference on Google Colab (quick start)
-
-Click on the following link.
-
-https://colab.research.google.com/github/HassanBinHaroon/YOLOER_V1/blob/master/YOLOER_V1.ipynb
-
-### Must Do After Clicking
-
-#### >>>>> Change runtime type
-
-![](https://github.com/HassanBinHaroon/YOLOER_V1/blob/master/images/im1.png)
-
-#### >>>>> Select GPU
-
-![](https://github.com/HassanBinHaroon/YOLOER_V1/blob/master/images/im2.png)
-
-#### >>>>> Run All
-
-![](https://github.com/HassanBinHaroon/YOLOER_V1/blob/master/images/im3.png)
-
-### Results Visualization
-
-![](https://github.com/HassanBinHaroon/YOLOER_V2/blob/master/demo/YOLOER_V2_1.png)
-
-Note! The project is still in progress.
