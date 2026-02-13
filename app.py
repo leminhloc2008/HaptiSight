@@ -48,7 +48,7 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-12-enact9-modes-camerafix-accuracy")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-13-enact10-profilefix-handfilter")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -81,6 +81,9 @@ HAND_YOLOE_ENABLED = os.getenv("HAND_YOLOE_ENABLED", "1").strip().lower() in {"1
 HAND_YOLOE_EVERY_N = max(1, int(os.getenv("HAND_YOLOE_EVERY_N", "5")))
 HAND_YOLOE_IMG_SIZE = max(224, int(os.getenv("HAND_YOLOE_IMG_SIZE", "320")))
 HAND_YOLOE_CONF = float(os.getenv("HAND_YOLOE_CONF", "0.22"))
+HAND_YOLOE_MIN_ACCEPT_CONF = float(os.getenv("HAND_YOLOE_MIN_ACCEPT_CONF", "0.42"))
+HAND_YOLOE_MIN_AREA_RATIO = float(os.getenv("HAND_YOLOE_MIN_AREA_RATIO", "0.0025"))
+HAND_YOLOE_MAX_AREA_RATIO = float(os.getenv("HAND_YOLOE_MAX_AREA_RATIO", "0.40"))
 HAND_YOLOE_MODEL_ID = str(os.getenv("HAND_YOLOE_MODEL_ID", "yoloe-v8s")).strip() or "yoloe-v8s"
 
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
@@ -750,17 +753,52 @@ class RealtimeEngine:
             xyxy = boxes.xyxy.detach().cpu().numpy()
             confs = boxes.conf.detach().cpu().numpy()
             h, w = frame_bgr.shape[:2]
-            best_idx = int(np.argmax(confs))
-            x1, y1, x2, y2 = [int(v) for v in xyxy[best_idx]]
-            x1 = int(np.clip(x1, 0, w - 1))
-            y1 = int(np.clip(y1, 0, h - 1))
-            x2 = int(np.clip(x2, 0, w - 1))
-            y2 = int(np.clip(y2, 0, h - 1))
-            if x2 <= x1 or y2 <= y1:
+            min_accept = max(float(HAND_MIN_SCORE), float(HAND_YOLOE_MIN_ACCEPT_CONF))
+            prev_bbox = self.hand_last_state.get("bbox_xyxy", None) if isinstance(self.hand_last_state, dict) else None
+            img_area = float(max(1, h * w))
+
+            best_candidate: Optional[Tuple[float, int, int, int, int, float]] = None
+            for idx in range(len(xyxy)):
+                x1, y1, x2, y2 = [int(v) for v in xyxy[idx]]
+                x1 = int(np.clip(x1, 0, w - 1))
+                y1 = int(np.clip(y1, 0, h - 1))
+                x2 = int(np.clip(x2, 0, w - 1))
+                y2 = int(np.clip(y2, 0, h - 1))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                score = float(np.clip(confs[idx], 0.0, 1.0))
+                if score < min_accept:
+                    continue
+                bw = float(x2 - x1)
+                bh = float(y2 - y1)
+                area_ratio = (bw * bh) / img_area
+                if area_ratio < float(HAND_YOLOE_MIN_AREA_RATIO) or area_ratio > float(HAND_YOLOE_MAX_AREA_RATIO):
+                    continue
+                aspect = bw / max(bh, 1.0)
+                if aspect < 0.40 or aspect > 2.60:
+                    continue
+
+                # Penalize border-touching boxes; these are often table/scene fragments.
+                border_touch = int(x1 <= 1) + int(y1 <= 1) + int(x2 >= w - 2) + int(y2 >= h - 2)
+                if border_touch >= 2 and score < 0.62:
+                    continue
+
+                cx = float(0.5 * (x1 + x2))
+                cy = float(0.5 * (y1 + y2))
+                cdx = abs((cx / max(1.0, float(w))) - 0.5)
+                cdy = abs((cy / max(1.0, float(h))) - 0.56)
+                center_prior = 1.0 - min(1.0, np.sqrt(cdx * cdx + cdy * cdy) * 1.35)
+
+                temporal_iou = _bbox_iou_xyxy(prev_bbox, [x1, y1, x2, y2]) if prev_bbox is not None else 0.0
+                if (prev_bbox is not None) and temporal_iou < 0.02 and score < 0.58:
+                    continue
+                rank = float(score + 0.24 * temporal_iou + 0.08 * center_prior - 0.10 * float(border_touch))
+                if best_candidate is None or rank > best_candidate[0]:
+                    best_candidate = (rank, x1, y1, x2, y2, score)
+
+            if best_candidate is None:
                 return None
-            score = float(np.clip(confs[best_idx], 0.0, 1.0))
-            if score < float(HAND_MIN_SCORE):
-                return None
+            _, x1, y1, x2, y2, score = best_candidate
             cx = float(0.5 * (x1 + x2))
             cy = float(0.5 * (y1 + y2))
             return {
@@ -1200,6 +1238,7 @@ class RealtimeEngine:
         depth_alpha: float,
         depth_interval: int,
         class_prompt: str,
+        profile_name: str = "",
     ) -> Tuple[np.ndarray, str, Dict[str, object]]:
         start = time.perf_counter()
         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
@@ -1208,6 +1247,7 @@ class RealtimeEngine:
         base_img_size = int(np.clip(int(img_size), 128, 640))
         base_img_size = max(128, (base_img_size // 32) * 32)
         run_img_size, run_conf, run_mode = self._select_adaptive_infer_settings(base_img_size, float(conf_thres))
+        profile_label = str(profile_name or "").strip() or "Custom"
 
         prompt_error = self._apply_prompt_classes_if_needed(class_prompt)
         prompt_active = bool(self.active_prompt_classes)
@@ -1367,6 +1407,16 @@ class RealtimeEngine:
                 conf = float(conf_np[idx])
                 cls_id = int(cls_np[idx])
                 name = self._class_name(cls_id)
+                bw = float(x2 - x1)
+                bh = float(y2 - y1)
+                area_ratio = (bw * bh) / float(max(1, img_w * img_h))
+                if area_ratio < 0.00035 and conf < max(0.44, run_conf + 0.06):
+                    continue
+                if area_ratio > 0.88 and conf < 0.60:
+                    continue
+                aspect = bw / max(bh, 1.0)
+                if (aspect > 7.0 or aspect < 0.14) and conf < 0.58:
+                    continue
 
                 scaled_x1 = (x1 / img_w) * self.ORIG_WIDTH
                 scaled_x2 = (x2 / img_w) * self.ORIG_WIDTH
@@ -1502,7 +1552,7 @@ class RealtimeEngine:
                 fps = 1000.0 / max(latency_ms, 1e-6)
                 stats = (
                     f"detector={self.detector_label} | objects=0 | latency={latency_ms:.1f}ms | fps~{fps:.1f}"
-                    f" | mode={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
+                    f" | profile={profile_label} | infer={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
                     f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
                 )
                 if hand_scene.get("visible"):
@@ -1761,7 +1811,7 @@ class RealtimeEngine:
             f"detector={self.detector_label} | objects={object_count} | "
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
-        stats += f" | mode={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
+        stats += f" | profile={profile_label} | infer={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
         if self.obj_track_state:
             stats += f" | tracks={len(self.obj_track_state)}"
         if self.active_prompt_classes:
@@ -1922,6 +1972,7 @@ class AsyncInferenceWorker:
         depth_interval,
         prompt_enabled,
         class_prompt,
+        profile_name,
     ):
         frame = normalize_frame(frame)
         if frame is None:
@@ -1937,6 +1988,7 @@ class AsyncInferenceWorker:
             float(depth_alpha),
             int(depth_interval),
             str(class_prompt or "") if bool(prompt_enabled) else "",
+            str(profile_name or ""),
         )
         with self._lock:
             busy_before_submit = self._done_seq < self._pending_seq
@@ -2700,6 +2752,7 @@ def process_frame(
         depth_interval,
         prompt_focus_enabled,
         effective_prompt,
+        profile_name,
     )
     scene_state = worker.latest_scene()
     guide_md, speech_payload, guide_timeline = guidance_worker.submit(

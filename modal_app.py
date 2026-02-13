@@ -74,6 +74,9 @@ image = (
             "HAND_YOLOE_EVERY_N": os.getenv("HAND_YOLOE_EVERY_N", "5"),
             "HAND_YOLOE_IMG_SIZE": os.getenv("HAND_YOLOE_IMG_SIZE", "320"),
             "HAND_YOLOE_CONF": os.getenv("HAND_YOLOE_CONF", "0.22"),
+            "HAND_YOLOE_MIN_ACCEPT_CONF": os.getenv("HAND_YOLOE_MIN_ACCEPT_CONF", "0.42"),
+            "HAND_YOLOE_MIN_AREA_RATIO": os.getenv("HAND_YOLOE_MIN_AREA_RATIO", "0.0025"),
+            "HAND_YOLOE_MAX_AREA_RATIO": os.getenv("HAND_YOLOE_MAX_AREA_RATIO", "0.40"),
             "HAND_YOLOE_MODEL_ID": os.getenv("HAND_YOLOE_MODEL_ID", "yoloe-v8s"),
             "HAND_SMOOTH_ALPHA": os.getenv("HAND_SMOOTH_ALPHA", "0.55"),
             "HAND_TARGET_REACH_M": os.getenv("HAND_TARGET_REACH_M", "0.12"),
@@ -82,6 +85,7 @@ image = (
             "WEBCAM_CAPTURE_W": os.getenv("WEBCAM_CAPTURE_W", "640"),
             "WEBCAM_CAPTURE_H": os.getenv("WEBCAM_CAPTURE_H", "360"),
             "WEBCAM_CAPTURE_FPS": os.getenv("WEBCAM_CAPTURE_FPS", "24"),
+            "APP_BUILD": os.getenv("APP_BUILD", "2026-02-13-enact10-profilefix-handfilter"),
         }
     )
     .add_local_dir(
