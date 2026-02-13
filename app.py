@@ -48,7 +48,7 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-12-enact8-accuracy-stable-filter")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-12-enact9-modes-camerafix-accuracy")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -2728,6 +2728,16 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
     gpu_mode = (not force_cpu) and torch.cuda.is_available()
     if gpu_mode:
         return {
+            "Fast": {
+                "conf": 0.38,
+                "iou": 0.50,
+                "img_size": 416,
+                "max_det": 16,
+                "smooth": 0.34,
+                "depth_enabled": True,
+                "depth_alpha": 0.04,
+                "depth_interval": 10,
+            },
             "30fps-stable": {
                 "conf": 0.34,
                 "iou": 0.52,
@@ -2758,6 +2768,26 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "depth_alpha": 0.10,
                 "depth_interval": 6,
             },
+            "High Accuracy": {
+                "conf": 0.42,
+                "iou": 0.58,
+                "img_size": 640,
+                "max_det": 36,
+                "smooth": 0.44,
+                "depth_enabled": True,
+                "depth_alpha": 0.10,
+                "depth_interval": 5,
+            },
+            "Ultra Accuracy": {
+                "conf": 0.46,
+                "iou": 0.62,
+                "img_size": 704,
+                "max_det": 48,
+                "smooth": 0.48,
+                "depth_enabled": True,
+                "depth_alpha": 0.11,
+                "depth_interval": 4,
+            },
             "Precision": {
                 "conf": 0.24,
                 "iou": 0.60,
@@ -2771,6 +2801,16 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
         }
 
     return {
+        "Fast": {
+            "conf": 0.56,
+            "iou": 0.44,
+            "img_size": 224,
+            "max_det": 10,
+            "smooth": 0.40,
+            "depth_enabled": True,
+            "depth_alpha": 0.06,
+            "depth_interval": 11,
+        },
         "30fps-stable": {
             "conf": 0.48,
             "iou": 0.45,
@@ -2800,6 +2840,26 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "depth_enabled": True,
             "depth_alpha": 0.15,
             "depth_interval": 6,
+        },
+        "High Accuracy": {
+            "conf": 0.52,
+            "iou": 0.54,
+            "img_size": 352,
+            "max_det": 22,
+            "smooth": 0.56,
+            "depth_enabled": True,
+            "depth_alpha": 0.16,
+            "depth_interval": 5,
+        },
+        "Ultra Accuracy": {
+            "conf": 0.56,
+            "iou": 0.58,
+            "img_size": 384,
+            "max_det": 28,
+            "smooth": 0.60,
+            "depth_enabled": True,
+            "depth_alpha": 0.18,
+            "depth_interval": 4,
         },
         "Precision": {
             "conf": 0.34,
@@ -4395,7 +4455,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "</div>"
         "</div>"
     )
-    _default_profile_name = "30fps-stable" if "30fps-stable" in PROFILE_PRESETS else "Realtime"
+    _default_profile_name = "High Accuracy" if "High Accuracy" in PROFILE_PRESETS else ("30fps-stable" if "30fps-stable" in PROFILE_PRESETS else "Realtime")
     _default_profile = PROFILE_PRESETS[_default_profile_name]
 
     with gr.Row(equal_height=False):
@@ -4413,9 +4473,9 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                 )
                 with gr.Row():
                     profile = gr.Dropdown(
-                        choices=["30fps-stable", "Realtime", "Balanced", "Precision"],
+                        choices=["Fast", "30fps-stable", "Balanced", "High Accuracy", "Ultra Accuracy", "Realtime", "Precision"],
                         value=_default_profile_name,
-                        label="Performance profile",
+                        label="Vision mode",
                     )
                     camera_mode = gr.Dropdown(
                         choices=["auto", "front", "back"],
@@ -4644,6 +4704,37 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         outputs=[cam_perm_status],
         queue=False,
     )
+    camera_mode.change(
+        fn=None,
+        inputs=[camera_mode, camera_device_id],
+        js=(
+            "(mode, deviceId) => {"
+            "  const picker = window.__yoloerPickCamera;"
+            "  if (typeof picker !== 'function') { return 'Camera helper is not ready.'; }"
+            "  return picker(String(mode || 'auto').toLowerCase(), String(deviceId || '').trim())"
+            "    .then((msg) => `Camera mode applied: ${msg}`)"
+            "    .catch((e)=>`Camera mode error: ${e?.message || e}`);"
+            "}"
+        ),
+        outputs=[cam_perm_status],
+        queue=False,
+    )
+    camera_device_id.change(
+        fn=None,
+        inputs=[camera_mode, camera_device_id],
+        js=(
+            "(mode, deviceId) => {"
+            "  const picker = window.__yoloerPickCamera;"
+            "  if (typeof picker !== 'function') { return 'Camera helper is not ready.'; }"
+            "  if (!String(deviceId || '').trim()) { return 'DeviceId empty. Using mode only.'; }"
+            "  return picker(String(mode || 'auto').toLowerCase(), String(deviceId || '').trim())"
+            "    .then((msg) => `Camera device applied: ${msg}`)"
+            "    .catch((e)=>`Camera device error: ${e?.message || e}`);"
+            "}"
+        ),
+        outputs=[cam_perm_status],
+        queue=False,
+    )
     cam_list_btn.click(
         fn=None,
         js=(
@@ -4685,24 +4776,51 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             "window.__yoloerSpeechLastRaw = '';"
             "window.__yoloerSpeechBusy = false;"
             "window.__yoloerSpeechQueued = null;"
-            "window.__yoloerGetVideoEl = () => "
-            "document.querySelector('#webcam_input video') || document.querySelector('video');"
+            "window.__yoloerCameraPref = window.__yoloerCameraPref || { mode: 'auto', deviceId: '' };"
+            "window.__yoloerGetVideoEl = () => {"
+            "  const inScope = Array.from(document.querySelectorAll('#webcam_input video'));"
+            "  const all = Array.from(document.querySelectorAll('video'));"
+            "  const pool = inScope.length ? inScope : all;"
+            "  if (!pool.length) { return null; }"
+            "  pool.sort((a, b) => {"
+            "    const aa = (a.clientWidth || 0) * (a.clientHeight || 0);"
+            "    const bb = (b.clientWidth || 0) * (b.clientHeight || 0);"
+            "    return bb - aa;"
+            "  });"
+            "  return pool[0] || null;"
+            "};"
+            "if (!window.__yoloerPatchedGUM && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {"
+            "  const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);"
+            "  window.__yoloerOrigGUM = origGUM;"
+            "  navigator.mediaDevices.getUserMedia = (constraints = {}) => {"
+            "    const c = (constraints && typeof constraints === 'object') ? { ...constraints } : {};"
+            "    if (c.video !== false) {"
+            "      const pref = window.__yoloerCameraPref || { mode: 'auto', deviceId: '' };"
+            "      const vIn = (c.video && typeof c.video === 'object') ? { ...c.video } : {};"
+            "      if (String(pref.deviceId || '').trim()) {"
+            "        vIn.deviceId = { exact: String(pref.deviceId).trim() };"
+            "      } else if (String(pref.mode || 'auto') === 'front') {"
+            "        vIn.facingMode = { ideal: 'user' };"
+            "      } else if (String(pref.mode || 'auto') === 'back') {"
+            "        vIn.facingMode = { ideal: 'environment' };"
+            "      }"
+            "      if (!vIn.width) { vIn.width = { ideal: 1280 }; }"
+            "      if (!vIn.height) { vIn.height = { ideal: 720 }; }"
+            "      c.video = vIn;"
+            "    }"
+            "    return origGUM(c);"
+            "  };"
+            "  window.__yoloerPatchedGUM = true;"
+            "}"
             "window.__yoloerPickCamera = async (mode, deviceId) => {"
             "  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {"
             "    throw new Error('getUserMedia is not available in this browser');"
             "  }"
             "  const useMode = String(mode || 'auto').toLowerCase();"
             "  const useDevice = String(deviceId || '').trim();"
+            "  window.__yoloerCameraPref = { mode: useMode, deviceId: useDevice };"
+            "  const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });"
             "  const v = window.__yoloerGetVideoEl();"
-            "  const video = { width: { ideal: 1280 }, height: { ideal: 720 } };"
-            "  if (useDevice) {"
-            "    video.deviceId = { exact: useDevice };"
-            "  } else if (useMode === 'front') {"
-            "    video.facingMode = { ideal: 'user' };"
-            "  } else if (useMode === 'back') {"
-            "    video.facingMode = { ideal: 'environment' };"
-            "  }"
-            "  const stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });"
             "  if (v) {"
             "    const old = v.srcObject;"
             "    v.srcObject = stream;"
