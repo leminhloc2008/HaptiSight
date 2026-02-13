@@ -48,7 +48,7 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.12"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-11-enact6-grasp-agent-memory")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-12-enact7-ui-timeline-focus-acc")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -1374,6 +1374,71 @@ class RealtimeEngine:
                 features.append([scaled_x1, scaled_y1, scaled_x2, scaled_y2])
                 parsed.append((x1, y1, x2, y2, conf, cls_id, name))
 
+            if parsed and prompt_active and self.active_prompt_classes:
+                prompt_classes = [str(x) for x in self.active_prompt_classes if str(x).strip()]
+                keep_idx: List[int] = []
+                for i, item in enumerate(parsed):
+                    nm = str(item[6])
+                    if any(_target_matches_name(cls_name, nm) for cls_name in prompt_classes):
+                        keep_idx.append(i)
+                if keep_idx:
+                    features = [features[i] for i in keep_idx]
+                    parsed = [parsed[i] for i in keep_idx]
+                    run_mode = f"{run_mode}+focus"
+                elif prompt_classes:
+                    focus_conf = float(np.clip(min(run_conf, 0.16), 0.06, 0.22))
+                    focus_img = max(run_img_size, 640 if self.use_cuda else 416)
+                    focus_img = int(np.clip(focus_img, 320, 960))
+                    focus_img = max(320, (focus_img // 32) * 32)
+                    with torch.inference_mode():
+                        focus_results = self.model.predict(
+                            source=infer_frame_bgr,
+                            imgsz=focus_img,
+                            conf=focus_conf,
+                            iou=float(iou_thres),
+                            max_det=max(int(max_det), 32),
+                            device=self.device,
+                            half=infer_half,
+                            verbose=False,
+                        )
+                    focus_pred = focus_results[0] if focus_results else None
+                    focus_boxes = focus_pred.boxes if focus_pred is not None else None
+                    if focus_boxes is not None and len(focus_boxes) > 0:
+                        xyxy_np = focus_boxes.xyxy.detach().cpu().numpy()
+                        conf_np = focus_boxes.conf.detach().cpu().numpy()
+                        cls_np = focus_boxes.cls.detach().cpu().numpy().astype(np.int32)
+                        names_obj = getattr(focus_pred, "names", None)
+                        names_map = self._names_to_dict(names_obj)
+                        if names_map:
+                            self.names = names_map
+                        f2 = []
+                        p2 = []
+                        for idx in range(len(xyxy_np)):
+                            x1, y1, x2, y2 = [int(v) for v in xyxy_np[idx]]
+                            x1 = int(np.clip(x1, 0, img_w - 1))
+                            y1 = int(np.clip(y1, 0, img_h - 1))
+                            x2 = int(np.clip(x2, 0, img_w - 1))
+                            y2 = int(np.clip(y2, 0, img_h - 1))
+                            if x2 <= x1 or y2 <= y1:
+                                continue
+                            conf = float(conf_np[idx])
+                            cls_id = int(cls_np[idx])
+                            name = self._class_name(cls_id)
+                            if not any(_target_matches_name(cls_name, name) for cls_name in prompt_classes):
+                                continue
+                            scaled_x1 = (x1 / img_w) * self.ORIG_WIDTH
+                            scaled_x2 = (x2 / img_w) * self.ORIG_WIDTH
+                            scaled_y1 = (y1 / img_h) * self.ORIG_HEIGHT
+                            scaled_y2 = (y2 / img_h) * self.ORIG_HEIGHT
+                            f2.append([scaled_x1, scaled_y1, scaled_x2, scaled_y2])
+                            p2.append((x1, y1, x2, y2, conf, cls_id, name))
+                        if p2:
+                            features = f2
+                            parsed = p2
+                            run_mode = f"{run_mode}+focusretry"
+                            run_conf = focus_conf
+                            run_img_size = focus_img
+
             if not parsed:
                 self.distance_cache = {}
                 self.xyz_cache = {}
@@ -2562,7 +2627,12 @@ def process_frame(
         return frame_to_html(placeholder), "Waiting for webcam frame...", guide_md, speech_payload, guide_timeline
 
     worker = get_worker()
-    effective_prompt = _merge_prompt_classes(str(class_prompt or ""), str(combined_query or ""), bool(auto_target_prompt))
+    seed_prompt = str(class_prompt or "").strip()
+    target_seed = _cleanup_target_phrase(str(target_object or ""))
+    target_seed = _canonical_target_name(target_seed) if target_seed else ""
+    if target_seed:
+        seed_prompt = f"{seed_prompt}, {target_seed}" if seed_prompt else target_seed
+    effective_prompt = _merge_prompt_classes(str(seed_prompt or ""), str(combined_query or ""), bool(auto_target_prompt))
     prompt_focus_enabled = bool(prompt_enabled)
     if (not prompt_focus_enabled) and bool(auto_target_prompt):
         # Auto-focus detector on query targets to reduce clutter/false positives.
@@ -4270,7 +4340,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "<div id='app-shell'>"
         "<div class='hero-card'>"
         "<h1 class='hero-title'>HaptiSight Realtime Guide</h1>"
-        "<p class='hero-sub'>One-target focus, depth-aware safety, and realtime voice guidance for object reaching.</p>"
+        f"<p class='hero-sub'>One-target focus, depth-aware safety, and realtime voice guidance for object reaching. Build: {APP_BUILD}</p>"
         "</div>"
         "</div>"
     )
@@ -4384,7 +4454,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                 )
                 class_prompt = gr.Textbox(
                     label="YOLOE prompt classes (comma-separated)",
-                    value="cup, bottle, apple, cell phone",
+                    value="",
                     lines=2,
                     placeholder="cup, bottle, apple, cell phone",
                 )
@@ -4405,6 +4475,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                 guide_timeline = gr.HTML(
                     value=_render_guidance_timeline_html([]),
                     label="Guidance timeline",
+                    elem_id="guide_timeline",
                 )
                 guide_md = gr.Markdown("Realtime guidance idle.")
                 speech_payload = gr.Textbox(
@@ -4644,8 +4715,23 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             "  window.speechSynthesis.speak(utter);"
             "};"
             "window.__yoloerSpeechTimer = setInterval(speak, 180);"
+            "window.__yoloerTimelineTimer = setInterval(() => {"
+            "  const root = document.querySelector('#guide_timeline');"
+            "  if (!root) { return; }"
+            "  const shell = root.querySelector('.lyrics-shell');"
+            "  const active = root.querySelector('.lyric-row.lyric-active');"
+            "  if (!shell || !active) { return; }"
+            "  const sr = shell.getBoundingClientRect();"
+            "  const ar = active.getBoundingClientRect();"
+            "  const margin = 18;"
+            "  const out = (ar.top < (sr.top + margin)) || (ar.bottom > (sr.bottom - margin));"
+            "  if (out) {"
+            "    active.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });"
+            "  }"
+            "}, 260);"
             "window.addEventListener('beforeunload', () => {"
             "  if (window.__yoloerSpeechTimer) { clearInterval(window.__yoloerSpeechTimer); }"
+            "  if (window.__yoloerTimelineTimer) { clearInterval(window.__yoloerTimelineTimer); }"
             "});"
             "return 'Voice hook ready';"
             "}"
