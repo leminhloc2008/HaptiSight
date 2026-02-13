@@ -41,12 +41,12 @@ WEBCAM_CAPTURE_H = int(os.getenv("WEBCAM_CAPTURE_H", "360"))
 WEBCAM_CAPTURE_FPS = int(os.getenv("WEBCAM_CAPTURE_FPS", "24"))
 OUTPUT_JPEG_QUALITY = int(os.getenv("OUTPUT_JPEG_QUALITY", "58"))
 STREAM_EVERY_SEC = float(os.getenv("STREAM_EVERY_SEC", "0.08"))
-PROMPT_CONF_CAP = float(os.getenv("PROMPT_CONF_CAP", "0.02"))
-PROMPT_CONF_RETRY = float(os.getenv("PROMPT_CONF_RETRY", "0.01"))
+PROMPT_CONF_CAP = float(os.getenv("PROMPT_CONF_CAP", "0.28"))
+PROMPT_CONF_RETRY = float(os.getenv("PROMPT_CONF_RETRY", "0.20"))
 PROMPT_IMG_SIZE = int(os.getenv("PROMPT_IMG_SIZE", "640"))
 PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
-ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.12"))
+ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
 APP_BUILD = os.getenv("APP_BUILD", "2026-02-12-enact7-ui-timeline-focus-acc")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
@@ -580,6 +580,7 @@ class RealtimeEngine:
         self.distance_cache: Dict[str, float] = {}
         self.xyz_cache: Dict[str, Tuple[float, float, float]] = {}
         self.xyz_filter_state: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
+        self.obj_track_state: Dict[str, Dict[str, float]] = {}
         self.depth_estimator = None
         self.depth_last_map = None
         self.depth_last_shape = None
@@ -1213,7 +1214,8 @@ class RealtimeEngine:
         if prompt_active and not prompt_error:
             run_img_size = max(run_img_size, max(320, (PROMPT_IMG_SIZE // 32) * 32))
             run_img_size = min(768, run_img_size)
-            run_conf = min(run_conf, float(np.clip(PROMPT_CONF_CAP, 0.01, 0.25)))
+            # Keep prompt mode strict enough to avoid false positives from open-vocabulary ambiguity.
+            run_conf = max(run_conf, float(np.clip(PROMPT_CONF_CAP, 0.12, 0.55)))
             run_mode = f"{run_mode}+prompt"
 
         depth_map = None
@@ -1271,7 +1273,7 @@ class RealtimeEngine:
         boxes = pred.boxes if pred is not None else None
 
         if prompt_active and not prompt_error and (boxes is None or len(boxes) == 0):
-            retry_conf = float(np.clip(PROMPT_CONF_RETRY, 0.005, max(0.05, run_conf)))
+            retry_conf = float(np.clip(PROMPT_CONF_RETRY, 0.10, max(0.30, run_conf)))
             retry_img = max(run_img_size, max(320, (PROMPT_IMG_SIZE // 32) * 32))
             with torch.inference_mode():
                 results_retry = self.model.predict(
@@ -1298,7 +1300,7 @@ class RealtimeEngine:
         # Accuracy rescue pass: if nothing is detected, re-run at larger size and lower conf.
         # This improves hard cases without slowing normal frames that already have detections.
         if ACCURACY_RETRY_ENABLED and (boxes is None or len(boxes) == 0):
-            retry_conf = float(np.clip(ACCURACY_RETRY_CONF, 0.05, max(0.18, run_conf)))
+            retry_conf = float(np.clip(ACCURACY_RETRY_CONF, 0.12, max(0.24, run_conf)))
             retry_img = int(np.clip(max(run_img_size, ACCURACY_RETRY_IMG), 320, 960))
             retry_img = max(320, (retry_img // 32) * 32)
             with torch.inference_mode():
@@ -1386,7 +1388,7 @@ class RealtimeEngine:
                     parsed = [parsed[i] for i in keep_idx]
                     run_mode = f"{run_mode}+focus"
                 elif prompt_classes:
-                    focus_conf = float(np.clip(min(run_conf, 0.16), 0.06, 0.22))
+                    focus_conf = float(np.clip(max(0.24, 0.90 * run_conf), 0.16, 0.42))
                     focus_img = max(run_img_size, 640 if self.use_cuda else 416)
                     focus_img = int(np.clip(focus_img, 320, 960))
                     focus_img = max(320, (focus_img // 32) * 32)
@@ -1439,10 +1441,56 @@ class RealtimeEngine:
                             run_conf = focus_conf
                             run_img_size = focus_img
 
+            if parsed:
+                prompt_classes = [str(x) for x in (self.active_prompt_classes or []) if str(x).strip()]
+                temporal_features: List[List[float]] = []
+                temporal_parsed: List[Tuple[int, int, int, int, float, int, str]] = []
+                next_track_state: Dict[str, Dict[str, float]] = {}
+                for i, item in enumerate(parsed):
+                    x1, y1, x2, y2, conf, cls_id, name = item
+                    key = f"{name}:{(x1 + x2) // 96}:{(y1 + y2) // 96}"
+                    prev = self.obj_track_state.get(key, {})
+                    prev_streak = int(prev.get("streak", 0.0) or 0)
+                    prev_ema = float(prev.get("conf_ema", conf) or conf)
+                    streak = min(12, prev_streak + 1)
+                    conf_ema = 0.62 * prev_ema + 0.38 * float(conf)
+                    next_track_state[key] = {
+                        "streak": float(streak),
+                        "conf_ema": float(conf_ema),
+                        "last_seen": float(time.time()),
+                    }
+
+                    is_prompt_match = bool(prompt_classes) and any(_target_matches_name(cls_name, str(name)) for cls_name in prompt_classes)
+                    keep = False
+                    if prompt_active and prompt_classes:
+                        strict_conf = max(float(run_conf), 0.30)
+                        stable_conf = max(0.24, 0.86 * float(run_conf))
+                        keep = (float(conf) >= strict_conf) or (streak >= 2 and conf_ema >= stable_conf)
+                        if is_prompt_match and (float(conf) >= max(0.24, 0.82 * float(run_conf))):
+                            keep = True
+                    else:
+                        strict_conf = max(float(run_conf) + 0.08, 0.50)
+                        stable_conf = max(0.34, float(run_conf))
+                        keep = (float(conf) >= strict_conf) or (streak >= 2 and conf_ema >= stable_conf)
+
+                    if keep:
+                        temporal_features.append(features[i])
+                        temporal_parsed.append(item)
+
+                self.obj_track_state = next_track_state
+                if temporal_parsed:
+                    features = temporal_features
+                    parsed = temporal_parsed
+                    run_mode = f"{run_mode}+stable"
+                else:
+                    parsed = []
+                    features = []
+
             if not parsed:
                 self.distance_cache = {}
                 self.xyz_cache = {}
                 self.xyz_filter_state = {}
+                self.obj_track_state = {}
                 self.miss_streak += 1
                 object_count = 0
                 if hand_scene.get("visible"):
@@ -1697,6 +1745,7 @@ class RealtimeEngine:
             self.distance_cache = {}
             self.xyz_cache = {}
             self.xyz_filter_state = {}
+            self.obj_track_state = {}
             if hand_scene.get("visible"):
                 hb = hand_scene.get("bbox_xyxy")
                 if isinstance(hb, (list, tuple)) and len(hb) >= 4:
@@ -1713,6 +1762,8 @@ class RealtimeEngine:
             f"latency={latency_ms:.1f}ms | fps~{fps:.1f}"
         )
         stats += f" | mode={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
+        if self.obj_track_state:
+            stats += f" | tracks={len(self.obj_track_state)}"
         if self.active_prompt_classes:
             stats += f" | prompt_cls={len(self.active_prompt_classes)}"
         if prompt_error:
@@ -2678,7 +2729,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
     if gpu_mode:
         return {
             "30fps-stable": {
-                "conf": 0.26,
+                "conf": 0.34,
                 "iou": 0.52,
                 "img_size": 480,
                 "max_det": 20,
@@ -2688,7 +2739,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "depth_interval": 8,
             },
             "Realtime": {
-                "conf": 0.24,
+                "conf": 0.32,
                 "iou": 0.54,
                 "img_size": 544,
                 "max_det": 24,
@@ -2698,7 +2749,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "depth_interval": 7,
             },
             "Balanced": {
-                "conf": 0.24,
+                "conf": 0.30,
                 "iou": 0.55,
                 "img_size": 608,
                 "max_det": 28,
@@ -2708,7 +2759,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "depth_interval": 6,
             },
             "Precision": {
-                "conf": 0.18,
+                "conf": 0.24,
                 "iou": 0.60,
                 "img_size": 704,
                 "max_det": 48,
@@ -2721,7 +2772,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
 
     return {
         "30fps-stable": {
-            "conf": 0.40,
+            "conf": 0.48,
             "iou": 0.45,
             "img_size": 256,
             "max_det": 12,
@@ -2731,7 +2782,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "depth_interval": 10,
         },
         "Realtime": {
-            "conf": 0.42,
+            "conf": 0.50,
             "iou": 0.45,
             "img_size": 288,
             "max_det": 14,
@@ -2741,7 +2792,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "depth_interval": 9,
         },
         "Balanced": {
-            "conf": 0.34,
+            "conf": 0.42,
             "iou": 0.50,
             "img_size": 320,
             "max_det": 18,
@@ -2751,7 +2802,7 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "depth_interval": 6,
         },
         "Precision": {
-            "conf": 0.26,
+            "conf": 0.34,
             "iou": 0.55,
             "img_size": 384,
             "max_det": 28,
