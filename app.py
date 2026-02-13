@@ -506,6 +506,20 @@ class HandTracker:
             "center_xy": [float(cx * sx), float(cy * sy)],
             "score": float(np.clip(score, 0.0, 1.0)),
             "handedness": handed,
+            "thumb_tip_xy": [float(pts[4][0] * sx), float(pts[4][1] * sy)] if len(pts) > 8 else None,
+            "index_tip_xy": [float(pts[8][0] * sx), float(pts[8][1] * sy)] if len(pts) > 8 else None,
+            "pinch_ratio": (
+                float(
+                    np.clip(
+                        np.sqrt((pts[8][0] - pts[4][0]) ** 2 + (pts[8][1] - pts[4][1]) ** 2)
+                        / max(8.0, np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)),
+                        0.0,
+                        2.0,
+                    )
+                )
+                if len(pts) > 8
+                else None
+            ),
             "source": "mediapipe",
         }
 
@@ -1316,6 +1330,9 @@ class RealtimeEngine:
             "handedness": str(hand_state.get("handedness", "")),
             "bbox_xyxy": hand_state.get("bbox_xyxy", None),
             "center_xy": hand_state.get("center_xy", None),
+            "thumb_tip_xy": hand_state.get("thumb_tip_xy", None),
+            "index_tip_xy": hand_state.get("index_tip_xy", None),
+            "pinch_ratio": hand_state.get("pinch_ratio", None),
             "xyz_m": None,
             "distance_m": None,
         }
@@ -1517,9 +1534,69 @@ class RealtimeEngine:
                     hand_lbl = "hand"
                     if hand_scene.get("distance_m") is not None:
                         hand_lbl = f"hand {float(hand_scene['distance_m']):.2f}m"
+                    pinch_ratio = hand_scene.get("pinch_ratio", None)
+                    if pinch_ratio is not None:
+                        try:
+                            hand_lbl += f" p{float(pinch_ratio):.2f}"
+                        except Exception:
+                            pass
                     self._draw_box(frame_bgr, hx1, hy1, hx2, hy2, hand_lbl, (80, 220, 255))
             else:
                 self.hand_xyz_cache = None
+
+            if hand_scene.get("visible"):
+                hb = hand_scene.get("bbox_xyxy")
+                hc = hand_scene.get("center_xy")
+                hand_interaction_candidates: List[Tuple[float, Dict[str, Any]]] = []
+                if isinstance(hb, (list, tuple)) and len(hb) >= 4:
+                    for obj in scene_objects:
+                        ob = obj.get("bbox_xyxy", None)
+                        if not isinstance(ob, (list, tuple)) or len(ob) < 4:
+                            continue
+                        iou = _bbox_iou_xyxy(hb, ob)
+                        overlap_small = _bbox_overlap_on_smaller(hb, ob)
+                        hc_hit = False
+                        oc_hit = False
+                        if isinstance(hc, (list, tuple)) and len(hc) >= 2:
+                            hc_hit = _point_in_bbox(float(hc[0]), float(hc[1]), ob)
+                        oc = _bbox_center_xyxy(ob)
+                        if oc is not None:
+                            oc_hit = _point_in_bbox(float(oc[0]), float(oc[1]), hb)
+
+                        depth_delta = None
+                        if isinstance(hand_scene.get("xyz_m"), list) and len(hand_scene.get("xyz_m")) >= 3:
+                            try:
+                                hz = float(hand_scene["xyz_m"][2])
+                                oz = float(obj.get("xyz_m", [0.0, 0.0, 0.0])[2])
+                                depth_delta = abs(hz - oz)
+                            except Exception:
+                                depth_delta = None
+                        depth_term = 0.0
+                        if depth_delta is not None:
+                            depth_term = float(np.clip(1.0 - depth_delta / 0.18, 0.0, 1.0))
+
+                        score = (
+                            0.44 * float(np.clip(overlap_small / 0.45, 0.0, 1.0))
+                            + 0.24 * float(np.clip(iou / 0.28, 0.0, 1.0))
+                            + 0.18 * (1.0 if (hc_hit or oc_hit) else 0.0)
+                            + 0.14 * depth_term
+                        )
+                        info = {
+                            "score": round(float(np.clip(score, 0.0, 1.0)), 3),
+                            "iou": round(float(iou), 3),
+                            "overlap_small": round(float(overlap_small), 3),
+                            "hand_center_in_obj": bool(hc_hit),
+                            "obj_center_in_hand": bool(oc_hit),
+                            "depth_delta_m": (round(float(depth_delta), 3) if depth_delta is not None else None),
+                        }
+                        obj["hand_interaction"] = info
+                        if float(info["score"]) >= 0.25:
+                            hand_interaction_candidates.append((float(info["score"]), {"name": str(obj.get("name", "")), **info}))
+                if hand_interaction_candidates:
+                    hand_interaction_candidates.sort(key=lambda x: x[0], reverse=True)
+                    hand_scene["interaction_top"] = hand_interaction_candidates[0][1]
+                else:
+                    hand_scene["interaction_top"] = None
 
             for obj in scene_objects:
                 if not bool(obj.get("is_dangerous", False)):
@@ -1595,6 +1672,23 @@ class RealtimeEngine:
             if isinstance(hand_scene.get("xyz_m"), list) and len(hand_scene.get("xyz_m")) >= 3:
                 hx, hy, hz = [float(v) for v in hand_scene.get("xyz_m", [0.0, 0.0, 0.0])]
                 stats += f" | hand_xyz=({hx:+.2f},{hy:+.2f},{hz:.2f})"
+            pinch_ratio = hand_scene.get("pinch_ratio", None)
+            if pinch_ratio is not None:
+                try:
+                    stats += f" | pinch={float(pinch_ratio):.2f}"
+                except Exception:
+                    pass
+            itop = hand_scene.get("interaction_top", None)
+            if isinstance(itop, dict):
+                iname = str(itop.get("name", ""))
+                iscore = itop.get("score", None)
+                if iname:
+                    stats += f" | hand_obj={iname}"
+                if iscore is not None:
+                    try:
+                        stats += f"({float(iscore):.2f})"
+                    except Exception:
+                        pass
         else:
             stats += " | hand=0"
         if self.hand_last_error:
@@ -1828,6 +1922,10 @@ class RealtimeGuidanceWorker:
         self._scene_memory_layout: Dict[str, Dict[str, float]] = {}
         self._scene_memory_last_note = ""
         self._scene_memory_last_ts = 0.0
+        self._touch_streak = 0
+        self._grasp_streak = 0
+        self._grasp_target = ""
+        self._grasp_hold_until_ts = 0.0
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -2255,6 +2353,57 @@ class RealtimeGuidanceWorker:
             guidance["scene_summary"] = guidance.get("scene_summary") or scene_summary
             guidance["scene_lines"] = guidance.get("scene_lines") or scene_lines
             guidance["budget_note"] = budget_note
+            phase_raw = str(guidance.get("phase", "")).strip().lower()
+            current_target_raw = _canonical_target_name(str(guidance.get("target", "")))
+            if not current_target_raw:
+                current_target_raw = self._grasp_target
+            raw_contact = bool(guidance.get("contact_detected", False))
+            raw_grasp = bool(guidance.get("grasp_detected", False))
+            if current_target_raw and current_target_raw != "unknown":
+                if self._grasp_target and self._grasp_target != current_target_raw:
+                    self._touch_streak = 0
+                    self._grasp_streak = 0
+                self._grasp_target = current_target_raw
+            if raw_contact:
+                self._touch_streak = min(8, self._touch_streak + 1)
+            else:
+                self._touch_streak = max(0, self._touch_streak - 1)
+            if raw_grasp:
+                self._grasp_streak = min(8, self._grasp_streak + 1)
+            else:
+                self._grasp_streak = max(0, self._grasp_streak - 1)
+
+            stable_contact = bool(raw_contact or self._touch_streak >= 2)
+            stable_grasp = bool(raw_grasp or self._grasp_streak >= 2)
+            if stable_grasp and self._grasp_target:
+                self._grasp_hold_until_ts = now + 1.8
+            if (
+                (not stable_grasp)
+                and self._grasp_target
+                and current_target_raw == self._grasp_target
+                and (now < self._grasp_hold_until_ts)
+                and stable_contact
+            ):
+                stable_grasp = True
+
+            if phase_raw in {"search", "search-target"} and self._grasp_target and now < self._grasp_hold_until_ts:
+                guidance["target"] = self._grasp_target
+                stable_contact = True
+                stable_grasp = True
+                guidance["phase"] = "complete-grasp"
+                guidance["say"] = _sanitize_guide_text(
+                    f"{self._grasp_target} is likely secured in your hand. Keep your wrist steady and move slowly."
+                )
+
+            guidance["contact_detected"] = bool(stable_contact)
+            guidance["grasp_detected"] = bool(stable_grasp)
+            guidance["touch_streak"] = int(self._touch_streak)
+            guidance["grasp_streak"] = int(self._grasp_streak)
+            if stable_grasp:
+                guidance["phase"] = "complete-grasp"
+            elif stable_contact and phase_raw in {"fine-tuning", "grasp"}:
+                guidance["phase"] = "complete-touch"
+
             say = _sanitize_guide_text(str(guidance.get("say", "")))
             phase = str(guidance.get("phase", ""))
             say_norm = _normalize_guide_text(say)
@@ -2276,6 +2425,7 @@ class RealtimeGuidanceWorker:
                         self._target_lock_name = current_target
                         self._target_lock_until_ts = now + float(GUIDE_TARGET_LOCK_SEC)
                 contact_detected = bool(guidance.get("contact_detected", False))
+                grasp_detected = bool(guidance.get("grasp_detected", False))
                 curr_norm = _normalize_guide_text(say)
                 sim_prev = _text_similarity(curr_norm, self._last_voice_norm)
                 elapsed_voice = now - self._last_voice_emit_ts
@@ -2283,6 +2433,8 @@ class RealtimeGuidanceWorker:
                 should_emit_voice = bool(cfg.get("voice_enabled", True))
                 if contact_detected:
                     self._task_complete_until_ts = max(self._task_complete_until_ts, now + 12.0)
+                if grasp_detected:
+                    self._task_complete_until_ts = max(self._task_complete_until_ts, now + 18.0)
                 if should_emit_voice:
                     if elapsed_voice < float(GUIDE_MIN_VOICE_EMIT_SEC) and sim_prev >= float(GUIDE_REPEAT_SIM_THRESHOLD):
                         should_emit_voice = False
@@ -2291,6 +2443,10 @@ class RealtimeGuidanceWorker:
                     if phase == "complete-touch" and elapsed_voice < 10.0 and sim_prev >= 0.86:
                         should_emit_voice = False
                     if phase == "complete-touch" and now < self._task_complete_until_ts and elapsed_voice < 3.5:
+                        should_emit_voice = False
+                    if phase == "complete-grasp" and elapsed_voice < 12.0 and sim_prev >= 0.84:
+                        should_emit_voice = False
+                    if phase == "complete-grasp" and now < self._task_complete_until_ts and elapsed_voice < 4.5:
                         should_emit_voice = False
                 if should_emit_voice and say:
                     self._last_spoken_text = say
@@ -3031,6 +3187,17 @@ def _build_local_realtime_guidance(
 
     target_bbox = focus_obj.get("bbox_xyxy", None) if isinstance(focus_obj, dict) else None
     hand_bbox = hand_state.get("bbox_xyxy", None) if isinstance(hand_state, dict) else None
+    hand_interaction = focus_obj.get("hand_interaction", {}) if isinstance(focus_obj, dict) else {}
+    if not isinstance(hand_interaction, dict):
+        hand_interaction = {}
+    interaction_score = float(hand_interaction.get("score", 0.0) or 0.0)
+    interaction_overlap = float(hand_interaction.get("overlap_small", 0.0) or 0.0)
+    pinch_ratio = hand_state.get("pinch_ratio", None) if isinstance(hand_state, dict) else None
+    try:
+        pinch_ratio = float(pinch_ratio) if pinch_ratio is not None else None
+    except Exception:
+        pinch_ratio = None
+    pinch_closed = bool(pinch_ratio is not None and pinch_ratio <= 0.30)
     hand_target_iou = _bbox_iou_xyxy(hand_bbox, target_bbox)
     hand_target_overlap = _bbox_overlap_on_smaller(hand_bbox, target_bbox)
     target_center = _bbox_center_xyxy(target_bbox)
@@ -3046,6 +3213,18 @@ def _build_local_realtime_guidance(
         target_diag = float(np.sqrt(max(_bbox_area_xyxy(target_bbox), 1.0)))
         center_norm = center_dist_px / max(8.0, 0.55 * target_diag)
 
+    hand_cover_target = 0.0
+    if hand_bbox is not None and target_bbox is not None:
+        ax1, ay1, ax2, ay2 = [float(v) for v in hand_bbox[:4]]
+        bx1, by1, bx2, by2 = [float(v) for v in target_bbox[:4]]
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_t = max(1e-6, _bbox_area_xyxy(target_bbox))
+        hand_cover_target = float(np.clip(inter / area_t, 0.0, 1.0))
+
     depth_near = bool(hand_to_target_m is not None and hand_to_target_m <= max(float(HAND_CONTACT_DIST_M) * 1.35, 0.075))
     reach_near = bool(hand_to_target_m is not None and hand_to_target_m <= max(float(HAND_TARGET_REACH_M) * 1.30, 0.16))
     contact_score = 0.0
@@ -3055,26 +3234,32 @@ def _build_local_realtime_guidance(
         contact_score += 0.27
     contact_score += 0.24 * float(np.clip(hand_target_overlap / 0.35, 0.0, 1.0))
     contact_score += 0.18 * float(np.clip(hand_target_iou / 0.28, 0.0, 1.0))
+    contact_score += 0.32 * float(np.clip(interaction_score, 0.0, 1.0))
+    contact_score += 0.14 * float(np.clip(interaction_overlap / 0.45, 0.0, 1.0))
     if center_norm < 0.65:
         contact_score += 0.13
+    if hand_cover_target >= 0.34:
+        contact_score += 0.12
+    if pinch_closed:
+        contact_score += 0.11
     if reach_near:
         contact_score += 0.08
     if hand_to_target_m is not None and hand_to_target_m > 0.22:
         contact_score -= 0.18
     contact_score = float(np.clip(contact_score, 0.0, 1.0))
-    contact_detected = bool(hand_visible and contact_score >= 0.62)
-    grasp_detected = bool(
-        hand_visible
-        and (
-            (contact_score >= 0.78 and hand_target_overlap >= 0.24)
-            or (
-                contact_detected
-                and hand_to_target_m is not None
-                and hand_to_target_m <= max(0.045, float(HAND_CONTACT_DIST_M) * 0.85)
-                and hand_target_overlap >= 0.16
-            )
-        )
-    )
+    contact_detected = bool(hand_visible and contact_score >= 0.56)
+    grasp_score = 0.0
+    grasp_score += 0.46 * contact_score
+    grasp_score += 0.25 * float(np.clip(hand_cover_target / 0.52, 0.0, 1.0))
+    grasp_score += 0.16 * float(np.clip(interaction_score, 0.0, 1.0))
+    if pinch_closed:
+        grasp_score += 0.18
+    if hand_to_target_m is not None and hand_to_target_m <= max(0.080, float(HAND_TARGET_REACH_M) * 0.95):
+        grasp_score += 0.11
+    if hand_to_target_m is not None and hand_to_target_m > 0.20:
+        grasp_score -= 0.18
+    grasp_score = float(np.clip(grasp_score, 0.0, 1.0))
+    grasp_detected = bool(hand_visible and grasp_score >= 0.64)
 
     depth_enabled_flag = bool((scene_state or {}).get("depth_enabled", False))
     depth_rel, fusion_w = _obj_depth_values(focus_obj)
@@ -3425,6 +3610,10 @@ def _build_local_realtime_guidance(
         "contact_detected": bool(contact_detected),
         "contact_score": round(float(contact_score), 3),
         "grasp_detected": bool(grasp_detected),
+        "grasp_score": round(float(grasp_score), 3),
+        "pinch_ratio": round(float(pinch_ratio), 3) if pinch_ratio is not None else None,
+        "hand_cover_target": round(float(hand_cover_target), 3),
+        "interaction_score": round(float(interaction_score), 3),
         "hand_target_iou": round(float(hand_target_iou), 3),
         "hand_target_overlap": round(float(hand_target_overlap), 3),
         "target_xyz_m": [round(float(target_xyz[0]), 3), round(float(target_xyz[1]), 3), round(float(target_xyz[2]), 3)],
@@ -3474,6 +3663,11 @@ def _render_realtime_guidance_markdown(
     contact_detected = bool((guidance or {}).get("contact_detected", False))
     grasp_detected = bool((guidance or {}).get("grasp_detected", False))
     contact_score = _f((guidance or {}).get("contact_score", 0.0), 0.0)
+    grasp_score = _f((guidance or {}).get("grasp_score", 0.0), 0.0)
+    pinch_ratio = (guidance or {}).get("pinch_ratio", None)
+    interaction_score = _f((guidance or {}).get("interaction_score", 0.0), 0.0)
+    touch_streak = int((guidance or {}).get("touch_streak", 0) or 0)
+    grasp_streak = int((guidance or {}).get("grasp_streak", 0) or 0)
     hand_xyz_m = (guidance or {}).get("hand_xyz_m", None)
     danger_count = int((guidance or {}).get("danger_count", 0) or 0)
     primary_danger = (guidance or {}).get("primary_danger", None)
@@ -3511,6 +3705,12 @@ def _render_realtime_guidance_markdown(
             hand_line += " | grasp: `yes`"
         if contact_score > 0:
             hand_line += f" | contact_score: `{contact_score:.2f}`"
+        if grasp_score > 0:
+            hand_line += f" | grasp_score: `{grasp_score:.2f}`"
+        if pinch_ratio is not None:
+            hand_line += f" | pinch: `{_f(pinch_ratio):.2f}`"
+        if interaction_score > 0:
+            hand_line += f" | hand_obj_score: `{interaction_score:.2f}`"
         if isinstance(hand_xyz_m, (list, tuple)) and len(hand_xyz_m) >= 3:
             hand_line += f" | xyz=(`{_f(hand_xyz_m[0]):+.2f}`, `{_f(hand_xyz_m[1]):+.2f}`, `{_f(hand_xyz_m[2]):.2f}`)"
         lines.append(hand_line)
@@ -3518,6 +3718,8 @@ def _render_realtime_guidance_markdown(
             lines.append("Task status: `target touched`")
         if grasp_detected:
             lines.append("Task status: `target grasped`")
+        if touch_streak > 0 or grasp_streak > 0:
+            lines.append(f"Stability: touch_streak=`{touch_streak}` | grasp_streak=`{grasp_streak}`")
     else:
         lines.append("Hand: `not visible`")
     if danger_count > 0:
