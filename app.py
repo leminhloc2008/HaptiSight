@@ -5,6 +5,7 @@ import time
 import json
 import base64
 import re
+import html
 from difflib import SequenceMatcher
 from collections import deque
 from pathlib import Path
@@ -1922,6 +1923,8 @@ class RealtimeGuidanceWorker:
         self._scene_memory_layout: Dict[str, Dict[str, float]] = {}
         self._scene_memory_last_note = ""
         self._scene_memory_last_ts = 0.0
+        self._timeline_events = deque(maxlen=24)
+        self._latest_timeline_html = _render_guidance_timeline_html([])
         self._touch_streak = 0
         self._grasp_streak = 0
         self._grasp_target = ""
@@ -1961,7 +1964,7 @@ class RealtimeGuidanceWorker:
         voice_rate: float,
         voice_pitch: float,
         depth_informed: bool,
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, str]:
         interval_sec = float(np.clip(float(interval_sec), GUIDE_MIN_INTERVAL_SEC, GUIDE_MAX_INTERVAL_SEC))
         query = (user_query or "").strip() or "Help me safely reach the target object."
         profile = (profile_name or "").strip() or "Realtime"
@@ -1993,7 +1996,7 @@ class RealtimeGuidanceWorker:
                     pitch=cfg["voice_pitch"],
                     token=self._last_speech_token,
                 )
-                return self._latest_md, self._latest_payload
+                return self._latest_md, self._latest_payload, self._latest_timeline_html
             if scene_state is None:
                 self._latest_md = "Realtime guidance waiting for camera scene..."
                 self._latest_payload = self._speech_payload(
@@ -2004,15 +2007,15 @@ class RealtimeGuidanceWorker:
                     pitch=cfg["voice_pitch"],
                     token=self._last_speech_token,
                 )
-                return self._latest_md, self._latest_payload
+                return self._latest_md, self._latest_payload, self._latest_timeline_html
             self._pending_scene = scene_state
             self._pending_config = cfg
             self._pending_seq += 1
-            return self._latest_md, self._latest_payload
+            return self._latest_md, self._latest_payload, self._latest_timeline_html
 
-    def latest_output(self) -> Tuple[str, str]:
+    def latest_output(self) -> Tuple[str, str, str]:
         with self._lock:
-            return self._latest_md, self._latest_payload
+            return self._latest_md, self._latest_payload, self._latest_timeline_html
 
     def _get_planner(self, api_key: str) -> GeminiMultiAgentPlanner:
         key = api_key if api_key else "__env__"
@@ -2243,6 +2246,34 @@ class RealtimeGuidanceWorker:
             return base
         return _sanitize_guide_text(f"{prefix} {base}")
 
+    def _push_timeline(self, text: str, phase: str, model_used: str, now: float) -> None:
+        msg = _sanitize_guide_text(text)
+        if not msg:
+            return
+        norm = _normalize_guide_text(msg)
+        if self._timeline_events:
+            last = self._timeline_events[-1]
+            last_norm = str(last.get("norm", ""))
+            last_phase = str(last.get("phase", ""))
+            last_ts = float(last.get("ts", 0.0) or 0.0)
+            if (
+                _text_similarity(norm, last_norm) >= 0.91
+                and str(phase or "") == last_phase
+                and (now - last_ts) < 2.2
+            ):
+                return
+        self._timeline_events.append(
+            {
+                "ts": float(now),
+                "phase": str(phase or "guidance"),
+                "model": str(model_used or "local"),
+                "text": msg,
+                "norm": norm,
+            }
+        )
+        events = [{k: v for k, v in item.items() if k != "norm"} for item in self._timeline_events]
+        self._latest_timeline_html = _render_guidance_timeline_html(events)
+
     def _run(self):
         while True:
             with self._lock:
@@ -2456,6 +2487,7 @@ class RealtimeGuidanceWorker:
                 if say:
                     self._hint_history.append(say)
                     self._norm_history.append(curr_norm)
+                    self._push_timeline(say, str(guidance.get("phase", "")), model_used, now)
                 self._latest_md = md
                 self._latest_payload = self._speech_payload(
                     text=say,
@@ -2480,6 +2512,7 @@ def process_frame(
     prompt_enabled,
     class_prompt,
     auto_target_prompt,
+    target_object,
     task_query,
     profile_name,
     gemini_api_key,
@@ -2492,14 +2525,15 @@ def process_frame(
     voice_pitch,
 ):
     guidance_worker = get_guidance_worker()
+    combined_query = _build_user_query(target_object, task_query)
     frame = normalize_frame(frame)
     if frame is None:
         worker = get_worker()
         latest_frame, latest_stats = worker.latest_output()
         latest_scene = worker.latest_scene()
-        guide_md, speech_payload = guidance_worker.submit(
+        guide_md, speech_payload, guide_timeline = guidance_worker.submit(
             scene_state=latest_scene,
-            user_query=task_query,
+            user_query=combined_query,
             profile_name=profile_name,
             api_key_input=gemini_api_key,
             enabled=bool(rt_guidance_enabled),
@@ -2513,7 +2547,7 @@ def process_frame(
         if latest_frame is not None:
             latest_frame = normalize_frame(latest_frame)
             if latest_frame is not None:
-                return frame_to_html(latest_frame), f"{latest_stats} | webcam_decode=retry", guide_md, speech_payload
+                return frame_to_html(latest_frame), f"{latest_stats} | webcam_decode=retry", guide_md, speech_payload, guide_timeline
         placeholder = np.zeros((WEBCAM_CAPTURE_H, WEBCAM_CAPTURE_W, 3), dtype=np.uint8)
         cv2.putText(
             placeholder,
@@ -2525,10 +2559,10 @@ def process_frame(
             2,
             cv2.LINE_AA,
         )
-        return frame_to_html(placeholder), "Waiting for webcam frame...", guide_md, speech_payload
+        return frame_to_html(placeholder), "Waiting for webcam frame...", guide_md, speech_payload, guide_timeline
 
     worker = get_worker()
-    effective_prompt = _merge_prompt_classes(str(class_prompt or ""), str(task_query or ""), bool(auto_target_prompt))
+    effective_prompt = _merge_prompt_classes(str(class_prompt or ""), str(combined_query or ""), bool(auto_target_prompt))
     prompt_focus_enabled = bool(prompt_enabled)
     if (not prompt_focus_enabled) and bool(auto_target_prompt):
         # Auto-focus detector on query targets to reduce clutter/false positives.
@@ -2547,9 +2581,9 @@ def process_frame(
         effective_prompt,
     )
     scene_state = worker.latest_scene()
-    guide_md, speech_payload = guidance_worker.submit(
+    guide_md, speech_payload, guide_timeline = guidance_worker.submit(
         scene_state=scene_state,
-        user_query=task_query,
+        user_query=combined_query,
         profile_name=profile_name,
         api_key_input=gemini_api_key,
         enabled=bool(rt_guidance_enabled),
@@ -2565,7 +2599,7 @@ def process_frame(
     if out_frame is None:
         out_frame = frame
     out_frame = downscale_frame(out_frame, MAX_OUTPUT_EDGE)
-    return frame_to_html(out_frame), out_stats, guide_md, speech_payload
+    return frame_to_html(out_frame), out_stats, guide_md, speech_payload, guide_timeline
 
 
 def _build_profile_presets() -> Dict[str, Dict[str, float]]:
@@ -2579,9 +2613,9 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "img_size": 480,
                 "max_det": 20,
                 "smooth": 0.36,
-                "depth_enabled": False,
-                "depth_alpha": 0.06,
-                "depth_interval": 10,
+                "depth_enabled": True,
+                "depth_alpha": 0.05,
+                "depth_interval": 8,
             },
             "Realtime": {
                 "conf": 0.24,
@@ -2589,9 +2623,9 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
                 "img_size": 544,
                 "max_det": 24,
                 "smooth": 0.36,
-                "depth_enabled": False,
-                "depth_alpha": 0.08,
-                "depth_interval": 8,
+                "depth_enabled": True,
+                "depth_alpha": 0.06,
+                "depth_interval": 7,
             },
             "Balanced": {
                 "conf": 0.24,
@@ -2622,9 +2656,9 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "img_size": 256,
             "max_det": 12,
             "smooth": 0.44,
-            "depth_enabled": False,
-            "depth_alpha": 0.10,
-            "depth_interval": 8,
+            "depth_enabled": True,
+            "depth_alpha": 0.08,
+            "depth_interval": 10,
         },
         "Realtime": {
             "conf": 0.42,
@@ -2632,9 +2666,9 @@ def _build_profile_presets() -> Dict[str, Dict[str, float]]:
             "img_size": 288,
             "max_det": 14,
             "smooth": 0.42,
-            "depth_enabled": False,
-            "depth_alpha": 0.10,
-            "depth_interval": 8,
+            "depth_enabled": True,
+            "depth_alpha": 0.09,
+            "depth_interval": 9,
         },
         "Balanced": {
             "conf": 0.34,
@@ -2697,6 +2731,49 @@ def _text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return float(SequenceMatcher(None, a, b).ratio())
+
+
+def _build_user_query(target_object: str, task_query: str) -> str:
+    target = _cleanup_target_phrase(str(target_object or ""))
+    target = _canonical_target_name(target) if target else ""
+    detail = " ".join(str(task_query or "").split()).strip()
+    if target:
+        if detail:
+            return f"I want to reach and grasp the {target}. {detail}"
+        return f"I want to reach and grasp the {target} safely."
+    return detail or "Help me safely reach the nearest target object."
+
+
+def _render_guidance_timeline_html(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return (
+            "<div class='lyrics-shell'>"
+            "<div class='lyrics-empty'>Realtime guidance timeline will appear here.</div>"
+            "</div>"
+        )
+    lines: List[str] = ["<div class='lyrics-shell'>"]
+    ordered = list(events)[::-1]
+    for idx, ev in enumerate(ordered):
+        text = html.escape(str(ev.get("text", "")).strip())
+        if not text:
+            continue
+        phase = html.escape(str(ev.get("phase", "")).strip() or "guidance")
+        model = html.escape(str(ev.get("model", "")).strip() or "local")
+        ts = float(ev.get("ts", 0.0) or 0.0)
+        tm = time.localtime(ts if ts > 1 else time.time())
+        tlabel = f"{tm.tm_hour:02d}:{tm.tm_min:02d}:{tm.tm_sec:02d}"
+        active = " lyric-active" if idx == 0 else ""
+        lines.append(
+            "<div class='lyric-row"
+            f"{active}'>"
+            f"<div class='lyric-meta'><span class='lyric-time'>{tlabel}</span>"
+            f"<span class='lyric-phase'>{phase}</span>"
+            f"<span class='lyric-model'>{model}</span></div>"
+            f"<div class='lyric-text'>{text}</div>"
+            "</div>"
+        )
+    lines.append("</div>")
+    return "".join(lines)
 
 
 def _scene_detail_for_ui(scene_state: Dict[str, Any]) -> Tuple[str, List[str]]:
@@ -3877,16 +3954,17 @@ def _render_plan_markdown(
     return "\n".join(lines)
 
 
-def run_smart_planner(user_query: str, profile_name: str, api_key_input: str):
+def run_smart_planner(target_object: str, user_query: str, profile_name: str, api_key_input: str):
     worker = get_worker()
     scene_state = worker.latest_scene()
     if not scene_state:
         msg = "Scene state is empty. Let the webcam run briefly, then click plan again."
         return msg, "{}"
 
+    query = _build_user_query(target_object, user_query)
     planner = GeminiMultiAgentPlanner(api_key=api_key_input.strip() if api_key_input else None)
     result = planner.plan(
-        user_query=user_query.strip() if user_query else "Reach the requested object safely.",
+        user_query=query,
         scene_state=scene_state,
         profile_name=profile_name,
         fov_deg=CAM_FOV_DEG,
@@ -3901,7 +3979,7 @@ def run_smart_planner(user_query: str, profile_name: str, api_key_input: str):
     else:
         fallback_used = True
         planner_error = str(result.error or "")
-        plan = _build_local_fallback_plan(user_query, scene_state)
+        plan = _build_local_fallback_plan(query, scene_state)
         model_used = "local-fallback"
         latency_ms = 0.0
 
@@ -4058,60 +4136,131 @@ _local_theme = gr.themes.Base(
 
 APP_CSS = """
 :root {
-  --panel-bg: #0f172a;
-  --panel-bg-soft: #111827;
-  --panel-border: #243145;
-  --text-strong: #e5edf8;
-  --text-soft: #a9b8cc;
-  --accent: #22c55e;
-  --accent-soft: #164e2f;
+  --panel-bg: #0b1620;
+  --panel-bg-soft: #102232;
+  --panel-border: #1e435d;
+  --text-strong: #edf7ff;
+  --text-soft: #a8c7dc;
+  --accent: #21d49b;
+  --accent-soft: #124f41;
+  --accent-2: #2ea0ff;
 }
 #app-shell {
-  background: radial-gradient(1200px 500px at 0% -20%, #1f2937 0%, #0b1220 42%, #050912 100%);
+  background: radial-gradient(1300px 620px at -8% -18%, #12314a 0%, #0a1824 45%, #040a10 100%);
 }
 .hero-card {
   border: 1px solid var(--panel-border);
-  background: linear-gradient(160deg, #0f172a 0%, #0b1324 100%);
-  border-radius: 14px;
-  padding: 14px 16px;
+  background: linear-gradient(160deg, #0f2333 0%, #0a1623 100%);
+  border-radius: 16px;
+  padding: 16px 18px;
   margin-bottom: 12px;
+  box-shadow: 0 12px 30px rgba(5, 12, 18, 0.45);
 }
 .hero-title {
   color: var(--text-strong);
-  font-size: 26px;
+  font-size: 28px;
   font-weight: 700;
-  letter-spacing: 0.2px;
+  letter-spacing: 0.3px;
   margin: 0 0 4px 0;
 }
 .hero-sub {
   color: var(--text-soft);
-  font-size: 13px;
+  font-size: 14px;
   margin: 0;
 }
 .panel {
   border: 1px solid var(--panel-border);
   background: linear-gradient(180deg, var(--panel-bg) 0%, var(--panel-bg-soft) 100%);
   border-radius: 14px;
-  padding: 10px;
+  padding: 12px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
 }
 .panel-title {
   color: var(--text-strong);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
   margin: 2px 2px 8px 2px;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.8px;
 }
 .status-note {
-  border: 1px solid #2f3e56;
+  border: 1px solid #22516e;
   border-radius: 10px;
-  background: #0e1829;
+  background: #0d1f2e;
 }
 .gradio-container .gr-button {
   border-radius: 10px;
 }
 .hidden-speech-field {
   display: none !important;
+}
+.lyrics-shell {
+  height: 240px;
+  overflow-y: auto;
+  border: 1px solid #24506a;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #0a1a27 0%, #0a1420 100%);
+  padding: 10px;
+}
+.lyrics-empty {
+  color: #8fb5ca;
+  font-size: 13px;
+  opacity: 0.9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+.lyric-row {
+  padding: 8px 10px;
+  border-radius: 9px;
+  margin-bottom: 6px;
+  border: 1px solid rgba(45, 111, 145, 0.28);
+  background: rgba(10, 27, 39, 0.72);
+  opacity: 0.72;
+  transition: all 120ms linear;
+}
+.lyric-row.lyric-active {
+  background: linear-gradient(90deg, rgba(33, 212, 155, 0.20) 0%, rgba(46, 160, 255, 0.14) 100%);
+  border: 1px solid rgba(33, 212, 155, 0.62);
+  box-shadow: 0 0 0 1px rgba(33, 212, 155, 0.18);
+  opacity: 1;
+}
+.lyric-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: #95bfd8;
+}
+.lyric-time {
+  color: #8fb2c7;
+}
+.lyric-phase {
+  color: #d4f6ff;
+  background: rgba(25, 73, 104, 0.65);
+  border: 1px solid rgba(84, 155, 197, 0.55);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.lyric-model {
+  color: #c7ffef;
+  background: rgba(27, 102, 80, 0.65);
+  border: 1px solid rgba(33, 212, 155, 0.42);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+.lyric-text {
+  color: #effbff;
+  font-size: 14px;
+  line-height: 1.36;
+}
+.focus-card {
+  border: 1px solid #25668a;
+  border-radius: 12px;
+  background: linear-gradient(160deg, #102537 0%, #0b1928 100%);
+  padding: 10px;
 }
 """
 
@@ -4120,8 +4269,8 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
     gr.HTML(
         "<div id='app-shell'>"
         "<div class='hero-card'>"
-        "<h1 class='hero-title'>YOLOER V2 Realtime Assist</h1>"
-        "<p class='hero-sub'>Focused realtime object + distance + 3D guidance. UI streamlined for live camera workflow.</p>"
+        "<h1 class='hero-title'>HaptiSight Realtime Guide</h1>"
+        "<p class='hero-sub'>One-target focus, depth-aware safety, and realtime voice guidance for object reaching.</p>"
         "</div>"
         "</div>"
     )
@@ -4170,11 +4319,20 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                 )
 
             with gr.Accordion("Realtime Guidance & Voice", open=True):
-                task_query = gr.Textbox(
-                    label="Task query",
-                    value="Help me safely reach the nearest cup on the table.",
-                    lines=2,
-                )
+                gr.Markdown("<div class='focus-card'><b>Focus Mission</b>: enter only the object you want to reach. Gemini will auto-extract target and generate realtime steps.</div>")
+                with gr.Row():
+                    target_object = gr.Textbox(
+                        label="Target object to reach",
+                        value="cup",
+                        lines=1,
+                        placeholder="cup, bottle, apple, phone...",
+                    )
+                    task_query = gr.Textbox(
+                        label="Extra context (optional)",
+                        value="Guide gently, concise, and safe for visually impaired user.",
+                        lines=1,
+                        placeholder="optional detail about environment or preference",
+                    )
                 gemini_api_key = gr.Textbox(
                     label="Gemini API key (session only)",
                     type="password",
@@ -4211,22 +4369,22 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
 
             with gr.Accordion("Detection Settings", open=True):
                 conf_slider = gr.Slider(0.10, 0.90, value=_default_profile["conf"], step=0.01, label="Confidence threshold")
-                iou_slider = gr.Slider(0.10, 0.90, value=0.45, step=0.01, label="IoU threshold")
+                iou_slider = gr.Slider(0.10, 0.90, value=_default_profile["iou"], step=0.01, label="IoU threshold")
                 size_slider = gr.Slider(192, 768, value=_default_profile["img_size"], step=32, label="Inference image size")
                 max_det_slider = gr.Slider(1, 80, value=_default_profile["max_det"], step=1, label="Max detections")
                 smooth_slider = gr.Slider(0.0, 0.95, value=_default_profile["smooth"], step=0.01, label="Distance smoothing")
 
-            with gr.Accordion("Depth + Prompt Classes", open=False):
+            with gr.Accordion("Depth + Prompt Classes", open=True):
                 depth_enabled = gr.Checkbox(value=bool(_default_profile["depth_enabled"]), label="Enable MiDaS depth")
                 depth_alpha = gr.Slider(0.0, 0.7, value=_default_profile["depth_alpha"], step=0.01, label="Depth overlay alpha")
                 depth_interval = gr.Slider(1, 12, value=_default_profile["depth_interval"], step=1, label="Depth update every N frames")
                 prompt_enabled = gr.Checkbox(
-                    value=False,
+                    value=True,
                     label="Enable YOLOE prompt classes (slower)",
                 )
                 class_prompt = gr.Textbox(
                     label="YOLOE prompt classes (comma-separated)",
-                    value="",
+                    value="cup, bottle, apple, cell phone",
                     lines=2,
                     placeholder="cup, bottle, apple, cell phone",
                 )
@@ -4243,6 +4401,11 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
                     label="Result",
                 )
                 stats = gr.Textbox(label="Runtime stats")
+                gr.Markdown("<div class='panel-title'>Realtime Guidance Timeline</div>")
+                guide_timeline = gr.HTML(
+                    value=_render_guidance_timeline_html([]),
+                    label="Guidance timeline",
+                )
                 guide_md = gr.Markdown("Realtime guidance idle.")
                 speech_payload = gr.Textbox(
                     value="",
@@ -4298,6 +4461,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             prompt_enabled,
             class_prompt,
             auto_target_prompt,
+            target_object,
             task_query,
             profile,
             gemini_api_key,
@@ -4309,7 +4473,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             voice_rate,
             voice_pitch,
         ],
-        outputs=[result, stats, guide_md, speech_payload],
+        outputs=[result, stats, guide_md, speech_payload, guide_timeline],
         **stream_kwargs,
     )
     cam_perm_btn.click(
@@ -4492,7 +4656,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
 
     plan_btn.click(
         run_smart_planner,
-        inputs=[task_query, profile, gemini_api_key],
+        inputs=[target_object, task_query, profile, gemini_api_key],
         outputs=[plan_md, plan_json],
         queue=False,
     )
