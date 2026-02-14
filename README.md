@@ -27,12 +27,55 @@ Realtime assistive vision app for object reaching:
 
 ## Run Locally
 
+Best option for speed and accuracy: run locally on your own computer.
+
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
 
 Then open the Gradio URL shown in terminal.
+
+## If Modal Shows Usage Limit
+
+When Modal usage is exhausted, the Modal web app shows a notice page and points to:
+
+- Hugging Face fallback: `https://huggingface.co/spaces/lml2008/haptisight-realtime-gemini`
+
+Important:
+
+- Hugging Face Space runs on CPU, so realtime FPS can be slower.
+- For better accuracy and performance, run this project locally (GPU preferred).
+
+## Local Run (Recommended for Best Quality)
+
+1. Install Python 3.10+.
+2. Clone this repository.
+3. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Set Gemini key (optional but recommended for full guidance):
+
+```bash
+export GEMINI_API_KEY=YOUR_KEY
+```
+
+Windows PowerShell:
+
+```powershell
+$env:GEMINI_API_KEY="YOUR_KEY"
+```
+
+5. Start app:
+
+```bash
+python app.py
+```
+
+6. Open the printed local URL in browser and allow camera + voice permissions.
 
 ## Hugging Face Space
 

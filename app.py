@@ -2965,11 +2965,16 @@ def _scene_detail_for_ui(scene_state: Dict[str, Any]) -> Tuple[str, List[str]]:
 
 
 def _billing_guard_notice_text() -> str:
-    left = f"{MODAL_BILLING_LEFT_USD:.2f}" if MODAL_BILLING_LEFT_USD >= 0 else "unknown"
-    threshold = f"{MODAL_BILLING_GUARD_THRESHOLD_USD:.2f}"
-    base = f"Modal billing guard active: remaining credit {left} USD (threshold {threshold} USD)."
+    base = (
+        "Due to high usage, the owner has run out Modal quota. "
+        "Please switch to the Hugging Face Space."
+    )
     if HF_FALLBACK_URL:
-        return f"{base} Please use Hugging Face app: {HF_FALLBACK_URL}"
+        return (
+            f"{base} Hugging Face link: {HF_FALLBACK_URL}. "
+            "Note: Hugging Face runs on CPU, so realtime speed can be slower. "
+            "For best speed and accuracy, download this project and run it on your computer."
+        )
     return base
 
 
@@ -4433,7 +4438,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "<div id='app-shell'>"
         "<div class='hero-card'>"
         "<h1 class='hero-title'>HaptiSight Realtime Guide</h1>"
-        f"<p class='hero-sub'>Gemini 3 Hackathon submission | Build: {APP_BUILD}</p>"
+        "<p class='hero-sub'>Gemini 3 Hackathon submission</p>"
         "</div>"
         "</div>"
     )
@@ -4757,13 +4762,15 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             f"window.__yoloerFallbackUrl='{_hf_url_js}';"
             "if (window.__yoloerBillingGuard) {"
             "  const url = window.__yoloerFallbackUrl || '';"
-            "  const note = 'Modal credit is low. Please continue on Hugging Face Space.';"
-            "  const link = url ? `<a href=\"${url}\" target=\"_blank\" rel=\"noopener\" style=\"color:#21d49b;font-weight:700;\">${url}</a>` : 'Hugging Face link is not configured yet.';"
+            "  const note = 'Due to high usage, the owner has run out Modal quota. Please switch to Hugging Face Space.';"
+            "  const hf = url ? `<a href=\"${url}\" target=\"_blank\" rel=\"noopener\" style=\"color:#21d49b;font-weight:700;\">${url}</a>` : 'Hugging Face link is not configured yet.';"
+            "  const extra = 'Hugging Face uses CPU, so realtime speed may be slower. For better accuracy and performance, download this project and run it locally on your computer (see GitHub README).';"
             "  document.body.innerHTML = `<div style=\"min-height:100vh;display:flex;align-items:center;justify-content:center;background:#071019;color:#ecf6ff;padding:24px;font-family:Segoe UI,sans-serif;\">` +"
             "    `<div style=\"max-width:840px;border:1px solid #1f4a62;border-radius:16px;background:#0d1f2e;padding:24px;box-shadow:0 14px 38px rgba(0,0,0,.35);\">` +"
             "    `<h1 style=\"margin:0 0 12px 0;font-size:30px;\">HaptiSight</h1>` +"
             "    `<p style=\"margin:0 0 10px 0;font-size:16px;line-height:1.5;\">${note}</p>` +"
-            "    `<p style=\"margin:0;font-size:14px;line-height:1.5;\">${link}</p>` +"
+            "    `<p style=\"margin:0 0 8px 0;font-size:14px;line-height:1.5;\">${hf}</p>` +"
+            "    `<p style=\"margin:0;font-size:14px;line-height:1.5;color:#b6d5e7;\">${extra}</p>` +"
             "    `</div></div>`;"
             "  return 'Billing guard active';"
             "}"
