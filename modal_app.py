@@ -82,7 +82,10 @@ image = (
             "WEBCAM_CAPTURE_W": os.getenv("WEBCAM_CAPTURE_W", "640"),
             "WEBCAM_CAPTURE_H": os.getenv("WEBCAM_CAPTURE_H", "360"),
             "WEBCAM_CAPTURE_FPS": os.getenv("WEBCAM_CAPTURE_FPS", "24"),
-            "APP_BUILD": os.getenv("APP_BUILD", "2026-02-13-enact11-mediapipe-handonly"),
+            "APP_BUILD": os.getenv("APP_BUILD", "2026-02-14-enact12-ui-gemini-billing-guard"),
+            "HF_FALLBACK_URL": os.getenv("HF_FALLBACK_URL", ""),
+            "MODAL_BILLING_LEFT_USD": os.getenv("MODAL_BILLING_LEFT_USD", ""),
+            "MODAL_BILLING_GUARD_THRESHOLD_USD": os.getenv("MODAL_BILLING_GUARD_THRESHOLD_USD", "5"),
         }
     )
     .add_local_dir(

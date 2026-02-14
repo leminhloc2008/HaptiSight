@@ -53,7 +53,19 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-13-enact11-mediapipe-handonly")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-14-enact12-ui-gemini-billing-guard")
+HF_FALLBACK_URL = os.getenv("HF_FALLBACK_URL", "").strip()
+try:
+    MODAL_BILLING_LEFT_USD = float(os.getenv("MODAL_BILLING_LEFT_USD", "-1"))
+except Exception:
+    MODAL_BILLING_LEFT_USD = -1.0
+try:
+    MODAL_BILLING_GUARD_THRESHOLD_USD = float(os.getenv("MODAL_BILLING_GUARD_THRESHOLD_USD", "5"))
+except Exception:
+    MODAL_BILLING_GUARD_THRESHOLD_USD = 5.0
+BILLING_GUARD_ACTIVE = bool(
+    MODAL_BILLING_LEFT_USD >= 0.0 and MODAL_BILLING_LEFT_USD <= max(0.0, MODAL_BILLING_GUARD_THRESHOLD_USD)
+)
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -2586,6 +2598,17 @@ def process_frame(
     voice_rate,
     voice_pitch,
 ):
+    if BILLING_GUARD_ACTIVE:
+        notice = _billing_guard_notice_text()
+        payload = json.dumps(
+            {"enabled": False, "token": "", "text": "", "lang": "en-US", "rate": 1.0, "pitch": 1.0},
+            ensure_ascii=False,
+        )
+        guard_timeline = _render_guidance_timeline_html(
+            [{"ts": time.time(), "phase": "billing-guard", "model": "system", "text": notice}]
+        )
+        return frame_to_html(None), notice, notice, payload, guard_timeline
+
     guidance_worker = get_guidance_worker()
     combined_query = _build_user_query(target_object, task_query)
     frame = normalize_frame(frame)
@@ -2936,6 +2959,15 @@ def _scene_detail_for_ui(scene_state: Dict[str, Any]) -> Tuple[str, List[str]]:
     nearest_d = _obj_d(top[0]) if top else -1.0
     summary = f"{len(ordered)} objects | nearest={nearest_name} {nearest_d:.2f}m"
     return summary, lines
+
+
+def _billing_guard_notice_text() -> str:
+    left = f"{MODAL_BILLING_LEFT_USD:.2f}" if MODAL_BILLING_LEFT_USD >= 0 else "unknown"
+    threshold = f"{MODAL_BILLING_GUARD_THRESHOLD_USD:.2f}"
+    base = f"Modal billing guard active: remaining credit {left} USD (threshold {threshold} USD)."
+    if HF_FALLBACK_URL:
+        return f"{base} Please use Hugging Face app: {HF_FALLBACK_URL}"
+    return base
 
 
 def _obj_pose(obj: Dict[str, Any]) -> Tuple[float, float, float, float, float]:
@@ -4398,7 +4430,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "<div id='app-shell'>"
         "<div class='hero-card'>"
         "<h1 class='hero-title'>HaptiSight Realtime Guide</h1>"
-        f"<p class='hero-sub'>One-target focus, depth-aware safety, and realtime voice guidance for object reaching. Build: {APP_BUILD}</p>"
+        f"<p class='hero-sub'>Gemini 3 Hackathon submission | Build: {APP_BUILD}</p>"
         "</div>"
         "</div>"
     )
@@ -4712,10 +4744,26 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         outputs=[cam_perm_status],
         queue=False,
     )
+    _hf_url_js = HF_FALLBACK_URL.replace("\\", "\\\\").replace("'", "\\'")
+    _billing_guard_js = "true" if BILLING_GUARD_ACTIVE else "false"
     demo.load(
         fn=None,
         js=(
             "() => {"
+            f"window.__yoloerBillingGuard={_billing_guard_js};"
+            f"window.__yoloerFallbackUrl='{_hf_url_js}';"
+            "if (window.__yoloerBillingGuard) {"
+            "  const url = window.__yoloerFallbackUrl || '';"
+            "  const note = 'Modal credit is low. Please continue on Hugging Face Space.';"
+            "  const link = url ? `<a href=\"${url}\" target=\"_blank\" rel=\"noopener\" style=\"color:#21d49b;font-weight:700;\">${url}</a>` : 'Hugging Face link is not configured yet.';"
+            "  document.body.innerHTML = `<div style=\"min-height:100vh;display:flex;align-items:center;justify-content:center;background:#071019;color:#ecf6ff;padding:24px;font-family:Segoe UI,sans-serif;\">` +"
+            "    `<div style=\"max-width:840px;border:1px solid #1f4a62;border-radius:16px;background:#0d1f2e;padding:24px;box-shadow:0 14px 38px rgba(0,0,0,.35);\">` +"
+            "    `<h1 style=\"margin:0 0 12px 0;font-size:30px;\">HaptiSight</h1>` +"
+            "    `<p style=\"margin:0 0 10px 0;font-size:16px;line-height:1.5;\">${note}</p>` +"
+            "    `<p style=\"margin:0;font-size:14px;line-height:1.5;\">${link}</p>` +"
+            "    `</div></div>`;"
+            "  return 'Billing guard active';"
+            "}"
             "if (window.__yoloerSpeechInit) { return 'Voice hook ready'; }"
             "window.__yoloerSpeechInit = true;"
             "window.__yoloerSpeechUnlocked = false;"
@@ -4831,20 +4879,7 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
             "  window.speechSynthesis.speak(utter);"
             "};"
             "window.__yoloerSpeechTimer = setInterval(speak, 180);"
-            "window.__yoloerTimelineTimer = setInterval(() => {"
-            "  const root = document.querySelector('#guide_timeline');"
-            "  if (!root) { return; }"
-            "  const shell = root.querySelector('.lyrics-shell');"
-            "  const active = root.querySelector('.lyric-row.lyric-active');"
-            "  if (!shell || !active) { return; }"
-            "  const sr = shell.getBoundingClientRect();"
-            "  const ar = active.getBoundingClientRect();"
-            "  const margin = 18;"
-            "  const out = (ar.top < (sr.top + margin)) || (ar.bottom > (sr.bottom - margin));"
-            "  if (out) {"
-            "    active.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });"
-            "  }"
-            "}, 260);"
+            "window.__yoloerTimelineTimer = null;"
             "window.addEventListener('beforeunload', () => {"
             "  if (window.__yoloerSpeechTimer) { clearInterval(window.__yoloerSpeechTimer); }"
             "  if (window.__yoloerTimelineTimer) { clearInterval(window.__yoloerTimelineTimer); }"

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -91,7 +92,15 @@ class GeminiMultiAgentPlanner:
                 error="Missing GEMINI_API_KEY (or GOOGLE_API_KEY).",
             )
 
-        prompt = self._build_realtime_prompt(user_query, scene_state, profile_name, fov_deg, previous_hint)
+        preferences = self._infer_user_preferences(user_query)
+        prompt = self._build_realtime_prompt(
+            user_query,
+            scene_state,
+            profile_name,
+            fov_deg,
+            previous_hint,
+            preferences,
+        )
         t0 = time.perf_counter()
         last_error = None
         variation_temp = 0.26 + 0.10 * ((int(time.time() * 10) % 3) / 2.0)
@@ -130,6 +139,43 @@ class GeminiMultiAgentPlanner:
             output={},
             error=last_error,
         )
+
+    @staticmethod
+    def _infer_user_preferences(user_query: str) -> Dict[str, str]:
+        q = " ".join(str(user_query or "").lower().split())
+        prefs = {
+            "tone": "calm",
+            "pace": "normal",
+            "detail": "balanced",
+            "style": "direct",
+            "user_profile": "general",
+        }
+        if any(k in q for k in ["elderly", "senior", "old", "grandma", "grandpa"]):
+            prefs["user_profile"] = "elderly"
+            prefs["pace"] = "slow"
+            prefs["detail"] = "detailed"
+            prefs["style"] = "gentle"
+        elif any(k in q for k in ["blind", "vision-impaired", "visually impaired", "low vision"]):
+            prefs["user_profile"] = "vision-impaired"
+            prefs["detail"] = "detailed"
+            prefs["style"] = "step-by-step"
+
+        if any(k in q for k in ["quick", "fast", "hurry", "asap"]):
+            prefs["pace"] = "fast"
+            prefs["detail"] = "concise"
+        if any(k in q for k in ["slowly", "careful", "carefully", "gentle"]):
+            prefs["pace"] = "slow"
+            prefs["style"] = "gentle"
+        if any(k in q for k in ["detailed", "detail", "explain", "full guidance"]):
+            prefs["detail"] = "detailed"
+        if any(k in q for k in ["short", "brief", "concise"]):
+            prefs["detail"] = "concise"
+        if any(k in q for k in ["encourage", "supportive", "reassure"]):
+            prefs["tone"] = "encouraging"
+        if re.search(r"\bchild|kid|teen\b", q):
+            prefs["user_profile"] = "young"
+            prefs["style"] = "simple"
+        return prefs
 
     def _call_generate_content(
         self,
@@ -274,9 +320,12 @@ Return JSON schema:
         profile_name: str,
         fov_deg: float,
         previous_hint: str,
+        preferences: Dict[str, str],
     ) -> str:
         scene_json = json.dumps(scene_state, ensure_ascii=True)
+        pref_json = json.dumps(preferences or {}, ensure_ascii=True)
         variation_seed = int(time.time() * 1000) % 1000000
+        style_variant = (variation_seed % 5) + 1
         return f"""
 You are a realtime assistive coach for a vision-impaired user.
 Return ONLY compact JSON.
@@ -287,6 +336,8 @@ Inputs:
 - camera_fov_deg: {fov_deg}
 - previous_hint: {previous_hint}
 - variation_seed: {variation_seed}
+- style_variant: {style_variant}
+- personalization_preferences: {pref_json}
 - scene_state: {scene_json}
 
 Rules:
@@ -294,6 +345,8 @@ Rules:
 - Do not switch to unrelated objects unless requested target is missing.
 - Speak calmly, clear, and actionable.
 - Use 2 to 3 complete sentences with natural cadence.
+- Personalize tone/pace/detail using personalization_preferences.
+- Vary sentence structure naturally across turns while preserving clear intent.
 - Use depth-informed cues when available: prioritize distance3d_m, xyz_m, depth_rel, fusion_w.
 - If scene_state.hand.visible is true, guide based on hand-to-target delta first (left/right/up/down/forward in small centimeters).
 - Use scene_state.dangerous_objects to prioritize at most one dangerous obstacle warning on current reach path.
@@ -317,6 +370,7 @@ JSON schema:
   "distance_m": 0.0,
   "direction": "left|right|center",
   "confidence": 0.0,
-  "safety_note": "..."
+  "safety_note": "...",
+  "personalization_note": "..."
 }}
 """.strip()
