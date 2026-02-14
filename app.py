@@ -129,6 +129,7 @@ TARGET_QUERY_PATTERNS = [
     r"(?:reach|grab|get|take|pick up|find|locate)\s+(?:the\s+|a\s+|an\s+)?([a-z][a-z0-9\-\s]{1,40})",
     r"(?:target|object)\s*(?:is|:)?\s*([a-z][a-z0-9\-\s]{1,40})",
 ]
+DISALLOWED_PROMPT_CLASSES = {"hand", "hands", "palm", "human hand"}
 
 
 def _norm_label(text: str) -> str:
@@ -234,6 +235,8 @@ def _parse_class_prompt_text(class_prompt: str) -> List[str]:
     seen = set()
     for item in items:
         c = _canonical_target_name(item)
+        if _norm_label(c) in DISALLOWED_PROMPT_CLASSES:
+            continue
         if c and c not in seen:
             seen.add(c)
             out.append(c)
@@ -376,14 +379,14 @@ class HandTracker:
     def __init__(self):
         self.error_message: Optional[str] = None
         self._hands = None
-        self.backend = "none"
+        self.backend = "unavailable"
         self._last_bbox: Optional[Tuple[int, int, int, int]] = None
         if mp_hands is not None:
             self.backend = "mediapipe"
         elif mp is not None and getattr(getattr(mp, "solutions", None), "hands", None) is not None:
             self.backend = "mediapipe"
         else:
-            self.backend = "opencv_skin"
+            self.error_message = "mediapipe_unavailable"
 
     def ensure_loaded(self):
         if self.backend != "mediapipe":
@@ -459,8 +462,8 @@ class HandTracker:
         }
 
     def detect(self, frame_rgb: np.ndarray) -> Optional[Dict[str, Any]]:
-        if self.backend == "opencv_skin":
-            return self._detect_skin_hand(frame_rgb)
+        if self.backend != "mediapipe":
+            return None
         self.ensure_loaded()
         assert self._hands is not None
         small = downscale_frame(frame_rgb, max(160, int(HAND_MAX_EDGE)))
@@ -612,6 +615,8 @@ class RealtimeEngine:
         self.hand_yolo_frame_counter = 0
         if self.hand_mode_forced:
             self.hand_yolo_error = "hand_mode_forced=mediapipe"
+        if self.hand_tracker is not None and getattr(self.hand_tracker, "backend", "") != "mediapipe":
+            self.hand_last_error = "hand_backend_unavailable=mediapipe"
 
     def _select_adaptive_infer_settings(self, base_img_size: int, base_conf: float) -> Tuple[int, float, str]:
         self.det_frame_counter += 1
@@ -1428,6 +1433,8 @@ class RealtimeEngine:
                     f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
                 )
                 stats += f" | hand_mode={self.hand_detect_mode}"
+                if self.hand_tracker is not None:
+                    stats += f" | hand_backend={getattr(self.hand_tracker, 'backend', 'none')}"
                 if hand_scene.get("visible"):
                     stats += " | hand=1"
                 result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -1754,6 +1761,8 @@ class RealtimeEngine:
                 stats += f" | depth_age={depth_age:.1f}s"
         stats += f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if infer_half else 0} | cpu_t={self.cpu_threads}"
         stats += f" | hand_mode={self.hand_detect_mode}"
+        if self.hand_tracker is not None:
+            stats += f" | hand_backend={getattr(self.hand_tracker, 'backend', 'none')}"
         stats += f" | build={APP_BUILD}"
         if depth_enabled:
             stats += f" | depth_model={self.depth_model_name}"

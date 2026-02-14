@@ -4,7 +4,7 @@ import importlib.util
 
 import modal
 
-APP_NAME = os.getenv("MODAL_APP_NAME", "yoloer-v2-realtime-stable15-targetlock").strip() or "yoloer-v2-realtime-stable15-targetlock"
+APP_NAME = os.getenv("MODAL_APP_NAME", "yoloer-v2-realtime-stable10-final1").strip() or "yoloer-v2-realtime-stable10-final1"
 PROJECT_DIR = "/root/hf_space_deploy"
 CACHE_DIR = "/tmp/yoloer_cache"
 
@@ -168,6 +168,7 @@ def warmup():
         "detector": engine.detector_label,
         "depth_model": engine.depth_model_name,
         "hand_mode": getattr(engine, "hand_detect_mode", "unknown"),
+        "hand_backend": getattr(getattr(engine, "hand_tracker", None), "backend", "none"),
         "hand_yolo_enabled": bool(getattr(engine, "hand_yolo_enabled", False)),
         "hand_yolo_loaded": bool(getattr(engine, "hand_yolo_model", None) is not None),
         "hand_yolo_error": getattr(engine, "hand_yolo_error", None),
