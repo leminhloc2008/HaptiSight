@@ -4442,6 +4442,10 @@ with gr.Blocks(title="YOLOER V2 - Realtime Distance Estimation", theme=_local_th
         "</div>"
         "</div>"
     )
+    gr.Markdown(
+        "For a quick walkthrough and usage guidance, watch this video: "
+        "[Vimeo demo and instructions](https://vimeo.com/1163333150?share=copy&fl=sv&fe=ci)"
+    )
     _default_profile_name = "High Accuracy" if "High Accuracy" in PROFILE_PRESETS else ("30fps-stable" if "30fps-stable" in PROFILE_PRESETS else "Realtime")
     _default_profile = PROFILE_PRESETS[_default_profile_name]
 
