@@ -169,6 +169,8 @@ def warmup():
         "depth_model": engine.depth_model_name,
         "hand_mode": getattr(engine, "hand_detect_mode", "unknown"),
         "hand_backend": getattr(getattr(engine, "hand_tracker", None), "backend", "none"),
+        "hand_tracker_error": getattr(getattr(engine, "hand_tracker", None), "error_message", None),
+        "hand_last_error": getattr(engine, "hand_last_error", None),
         "hand_yolo_enabled": bool(getattr(engine, "hand_yolo_enabled", False)),
         "hand_yolo_loaded": bool(getattr(engine, "hand_yolo_model", None) is not None),
         "hand_yolo_error": getattr(engine, "hand_yolo_error", None),

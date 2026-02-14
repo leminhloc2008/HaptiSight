@@ -1,4 +1,5 @@
 import os
+import sys
 import inspect
 import threading
 import time
@@ -23,12 +24,16 @@ from huggingface_hub import hf_hub_download
 from ultralytics import YOLOE
 try:
     import mediapipe as mp  # type: ignore
+    MP_IMPORT_ERROR = ""
 except Exception:
     mp = None
+    MP_IMPORT_ERROR = str(sys.exc_info()[1])
 try:
     from mediapipe.python.solutions import hands as mp_hands  # type: ignore
+    MP_HANDS_IMPORT_ERROR = ""
 except Exception:
     mp_hands = None
+    MP_HANDS_IMPORT_ERROR = str(sys.exc_info()[1])
 
 ROOT = Path(__file__).resolve().parent
 YOLO_DIR = ROOT / "distance_estimation_core"
@@ -386,7 +391,13 @@ class HandTracker:
         elif mp is not None and getattr(getattr(mp, "solutions", None), "hands", None) is not None:
             self.backend = "mediapipe"
         else:
-            self.error_message = "mediapipe_unavailable"
+            parts = []
+            if MP_IMPORT_ERROR:
+                parts.append(f"mp={MP_IMPORT_ERROR}")
+            if MP_HANDS_IMPORT_ERROR:
+                parts.append(f"mp_hands={MP_HANDS_IMPORT_ERROR}")
+            detail = "; ".join(parts) if parts else "unknown"
+            self.error_message = f"mediapipe_unavailable: {detail}"
 
     def ensure_loaded(self):
         if self.backend != "mediapipe":
