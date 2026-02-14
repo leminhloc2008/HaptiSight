@@ -73,11 +73,10 @@ modal run modal_app.py::benchmark
 - `CPU_THREADS`: torch CPU thread count
 - `DEPTH_MODEL`: `MiDaS_small` or `DPT_Hybrid`
 - `GEMINI_API_KEY`: Gemini API key (optional)
-- `HAND_DETECT_MODE`: `mediapipe`, `yoloe`, or `hybrid`
+- `HAND_DETECT_MODE`: keep `mediapipe` (recommended realtime hand backend)
 
 ## Runtime Notes
 
 - `30fps-stable` profile is tuned for smoother realtime behavior.
 - `Balanced` and `Precision` trade speed for higher depth/detail quality.
 - If browser voice is silent, click `Enable Camera Permission` or `Test Voice` once to unlock speech synthesis.
-

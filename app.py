@@ -48,7 +48,7 @@ PROMPT_FORCE_FP32 = os.getenv("PROMPT_FORCE_FP32", "1").strip().lower() in {"1",
 ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
-APP_BUILD = os.getenv("APP_BUILD", "2026-02-13-enact10-profilefix-handfilter")
+APP_BUILD = os.getenv("APP_BUILD", "2026-02-13-enact11-mediapipe-handonly")
 GUIDE_MIN_INTERVAL_SEC = float(os.getenv("GUIDE_MIN_INTERVAL_SEC", "0.8"))
 GUIDE_MAX_INTERVAL_SEC = float(os.getenv("GUIDE_MAX_INTERVAL_SEC", "6.0"))
 GUIDE_MAX_TEXT_CHARS = int(os.getenv("GUIDE_MAX_TEXT_CHARS", "260"))
@@ -76,14 +76,11 @@ HAND_SMOOTH_ALPHA = float(os.getenv("HAND_SMOOTH_ALPHA", "0.55"))
 HAND_TARGET_REACH_M = float(os.getenv("HAND_TARGET_REACH_M", "0.12"))
 HAND_CONTACT_DIST_M = float(os.getenv("HAND_CONTACT_DIST_M", "0.06"))
 HAND_CONTACT_IOU = float(os.getenv("HAND_CONTACT_IOU", "0.18"))
-HAND_DETECT_MODE = str(os.getenv("HAND_DETECT_MODE", "hybrid")).strip().lower()
-HAND_YOLOE_ENABLED = os.getenv("HAND_YOLOE_ENABLED", "1").strip().lower() in {"1", "true", "yes"}
+HAND_DETECT_MODE = str(os.getenv("HAND_DETECT_MODE", "mediapipe")).strip().lower()
+HAND_YOLOE_ENABLED = os.getenv("HAND_YOLOE_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 HAND_YOLOE_EVERY_N = max(1, int(os.getenv("HAND_YOLOE_EVERY_N", "5")))
 HAND_YOLOE_IMG_SIZE = max(224, int(os.getenv("HAND_YOLOE_IMG_SIZE", "320")))
 HAND_YOLOE_CONF = float(os.getenv("HAND_YOLOE_CONF", "0.22"))
-HAND_YOLOE_MIN_ACCEPT_CONF = float(os.getenv("HAND_YOLOE_MIN_ACCEPT_CONF", "0.42"))
-HAND_YOLOE_MIN_AREA_RATIO = float(os.getenv("HAND_YOLOE_MIN_AREA_RATIO", "0.0025"))
-HAND_YOLOE_MAX_AREA_RATIO = float(os.getenv("HAND_YOLOE_MAX_AREA_RATIO", "0.40"))
 HAND_YOLOE_MODEL_ID = str(os.getenv("HAND_YOLOE_MODEL_ID", "yoloe-v8s")).strip() or "yoloe-v8s"
 
 from smart_agent import GeminiMultiAgentPlanner  # noqa: E402
@@ -405,8 +402,8 @@ class HandTracker:
                 static_image_mode=False,
                 max_num_hands=1,
                 model_complexity=0,
-                min_detection_confidence=0.45,
-                min_tracking_confidence=0.45,
+                min_detection_confidence=0.55,
+                min_tracking_confidence=0.50,
             )
         except Exception as exc:
             self.error_message = f"hand_tracker_init_err={exc}"
@@ -607,17 +604,14 @@ class RealtimeEngine:
         self.hand_last_state: Dict[str, Any] = {"visible": False, "source": "disabled"}
         self.hand_last_error: Optional[str] = None
         self.hand_xyz_cache: Optional[Tuple[float, float, float]] = None
-        self.hand_detect_mode = HAND_DETECT_MODE if HAND_DETECT_MODE in {"mediapipe", "yoloe", "hybrid"} else "hybrid"
-        allow_hand_yolo_cpu = os.getenv("ALLOW_HAND_YOLO_CPU", "0").strip().lower() in {"1", "true", "yes"}
-        self.hand_yolo_enabled = bool(HAND_YOLOE_ENABLED and (self.use_cuda or allow_hand_yolo_cpu))
+        self.hand_detect_mode = "mediapipe"
+        self.hand_mode_forced = HAND_DETECT_MODE not in {"", "mediapipe"}
+        self.hand_yolo_enabled = False
         self.hand_yolo_model: Optional[YOLOE] = None
         self.hand_yolo_error: Optional[str] = None
         self.hand_yolo_frame_counter = 0
-        if self.hand_yolo_enabled and self.hand_detect_mode in {"yoloe", "hybrid"}:
-            try:
-                self._load_hand_yolo_detector()
-            except Exception as exc:
-                self.hand_yolo_error = str(exc)
+        if self.hand_mode_forced:
+            self.hand_yolo_error = "hand_mode_forced=mediapipe"
 
     def _select_adaptive_infer_settings(self, base_img_size: int, base_conf: float) -> Tuple[int, float, str]:
         self.det_frame_counter += 1
@@ -726,92 +720,9 @@ class RealtimeEngine:
             raise RuntimeError(self.hand_yolo_error)
 
     def _detect_hand_yoloe(self, frame_bgr: np.ndarray) -> Optional[Dict[str, Any]]:
-        if not self.hand_yolo_enabled or self.hand_detect_mode not in {"yoloe", "hybrid"}:
-            return None
-        if self.hand_yolo_model is None:
-            try:
-                self._load_hand_yolo_detector()
-            except Exception:
-                return None
-        assert self.hand_yolo_model is not None
-        try:
-            with torch.inference_mode():
-                results = self.hand_yolo_model.predict(
-                    source=frame_bgr,
-                    imgsz=max(224, (int(HAND_YOLOE_IMG_SIZE) // 32) * 32),
-                    conf=float(np.clip(HAND_YOLOE_CONF, 0.05, 0.60)),
-                    iou=0.45,
-                    max_det=2,
-                    device=self.device,
-                    half=False,
-                    verbose=False,
-                )
-            pred = results[0] if results else None
-            boxes = pred.boxes if pred is not None else None
-            if boxes is None or len(boxes) == 0:
-                return None
-            xyxy = boxes.xyxy.detach().cpu().numpy()
-            confs = boxes.conf.detach().cpu().numpy()
-            h, w = frame_bgr.shape[:2]
-            min_accept = max(float(HAND_MIN_SCORE), float(HAND_YOLOE_MIN_ACCEPT_CONF))
-            prev_bbox = self.hand_last_state.get("bbox_xyxy", None) if isinstance(self.hand_last_state, dict) else None
-            img_area = float(max(1, h * w))
-
-            best_candidate: Optional[Tuple[float, int, int, int, int, float]] = None
-            for idx in range(len(xyxy)):
-                x1, y1, x2, y2 = [int(v) for v in xyxy[idx]]
-                x1 = int(np.clip(x1, 0, w - 1))
-                y1 = int(np.clip(y1, 0, h - 1))
-                x2 = int(np.clip(x2, 0, w - 1))
-                y2 = int(np.clip(y2, 0, h - 1))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                score = float(np.clip(confs[idx], 0.0, 1.0))
-                if score < min_accept:
-                    continue
-                bw = float(x2 - x1)
-                bh = float(y2 - y1)
-                area_ratio = (bw * bh) / img_area
-                if area_ratio < float(HAND_YOLOE_MIN_AREA_RATIO) or area_ratio > float(HAND_YOLOE_MAX_AREA_RATIO):
-                    continue
-                aspect = bw / max(bh, 1.0)
-                if aspect < 0.40 or aspect > 2.60:
-                    continue
-
-                # Penalize border-touching boxes; these are often table/scene fragments.
-                border_touch = int(x1 <= 1) + int(y1 <= 1) + int(x2 >= w - 2) + int(y2 >= h - 2)
-                if border_touch >= 2 and score < 0.62:
-                    continue
-
-                cx = float(0.5 * (x1 + x2))
-                cy = float(0.5 * (y1 + y2))
-                cdx = abs((cx / max(1.0, float(w))) - 0.5)
-                cdy = abs((cy / max(1.0, float(h))) - 0.56)
-                center_prior = 1.0 - min(1.0, np.sqrt(cdx * cdx + cdy * cdy) * 1.35)
-
-                temporal_iou = _bbox_iou_xyxy(prev_bbox, [x1, y1, x2, y2]) if prev_bbox is not None else 0.0
-                if (prev_bbox is not None) and temporal_iou < 0.02 and score < 0.58:
-                    continue
-                rank = float(score + 0.24 * temporal_iou + 0.08 * center_prior - 0.10 * float(border_touch))
-                if best_candidate is None or rank > best_candidate[0]:
-                    best_candidate = (rank, x1, y1, x2, y2, score)
-
-            if best_candidate is None:
-                return None
-            _, x1, y1, x2, y2, score = best_candidate
-            cx = float(0.5 * (x1 + x2))
-            cy = float(0.5 * (y1 + y2))
-            return {
-                "visible": True,
-                "bbox_xyxy": [x1, y1, x2, y2],
-                "center_xy": [cx, cy],
-                "score": score,
-                "handedness": "",
-                "source": "yoloe_hand",
-            }
-        except Exception as exc:
-            self.hand_yolo_error = f"hand_yolo_infer_err={exc}"
-            return None
+        # Hand detection is intentionally Mediapipe-only for realtime stability.
+        # YOLOE remains object-only in this app.
+        return None
 
     def _download_file(self, url: str, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1100,10 +1011,7 @@ class RealtimeEngine:
         return depth_map, depth_err
 
     def _detect_hand(self, frame_rgb: np.ndarray) -> Dict[str, Any]:
-        if (self.hand_detect_mode == "mediapipe") and (self.hand_tracker is None):
-            self.hand_last_state = {"visible": False, "source": "disabled"}
-            return dict(self.hand_last_state)
-        if (self.hand_detect_mode == "yoloe") and (not self.hand_yolo_enabled):
+        if self.hand_tracker is None:
             self.hand_last_state = {"visible": False, "source": "disabled"}
             return dict(self.hand_last_state)
 
@@ -1112,53 +1020,17 @@ class RealtimeEngine:
         if (not must_refresh) and bool(self.hand_last_state.get("visible", False)):
             return dict(self.hand_last_state)
 
-        candidates: List[Dict[str, Any]] = []
+        det = None
+        try:
+            det = self.hand_tracker.detect(frame_rgb)
+        except Exception as exc:
+            self.hand_last_error = str(exc)
 
-        if self.hand_detect_mode in {"mediapipe", "hybrid"} and self.hand_tracker is not None:
-            try:
-                det = self.hand_tracker.detect(frame_rgb)
-                if det is not None:
-                    candidates.append(det)
-            except Exception as exc:
-                self.hand_last_error = str(exc)
-
-        run_yolo = False
-        if self.hand_detect_mode == "yoloe":
-            run_yolo = True
-        elif self.hand_detect_mode == "hybrid":
-            self.hand_yolo_frame_counter += 1
-            need_refresh_yolo = (self.hand_yolo_frame_counter % max(1, int(HAND_YOLOE_EVERY_N))) == 0
-            strong_candidate = any(float(c.get("score", 0.0)) >= 0.62 for c in candidates)
-            mp_backend_ok = bool(self.hand_tracker is not None and getattr(self.hand_tracker, "backend", "") == "mediapipe")
-            yolo_rescue_due = (self.hand_frame_counter % max(6, int(HAND_YOLOE_EVERY_N) * 3)) == 0
-            run_yolo = bool(
-                need_refresh_yolo
-                and (not strong_candidate)
-                and (
-                    (not mp_backend_ok)
-                    or bool(self.hand_last_error)
-                    or (not candidates and bool(self.hand_last_state.get("visible", False)))
-                    or yolo_rescue_due
-                )
-            )
-        if run_yolo:
-            det_yolo = self._detect_hand_yoloe(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-            if det_yolo is not None:
-                candidates.append(det_yolo)
-
-        if candidates:
-            candidates.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
-            self.hand_last_state = candidates[0]
+        if det is not None:
+            self.hand_last_state = det
             self.hand_last_error = None
         else:
-            source = "hybrid"
-            if self.hand_detect_mode == "mediapipe":
-                source = "mediapipe"
-            elif self.hand_detect_mode == "yoloe":
-                source = "yoloe_hand"
-            self.hand_last_state = {"visible": False, "source": source}
-            if self.hand_yolo_error and self.hand_detect_mode in {"yoloe", "hybrid"}:
-                self.hand_last_error = self.hand_yolo_error
+            self.hand_last_state = {"visible": False, "source": "mediapipe"}
         return dict(self.hand_last_state)
 
     @staticmethod
@@ -1555,6 +1427,7 @@ class RealtimeEngine:
                     f" | profile={profile_label} | infer={run_mode} | imgsz={run_img_size} | conf={run_conf:.2f} | miss={self.miss_streak}"
                     f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if self.use_half else 0} | cpu_t={self.cpu_threads}"
                 )
+                stats += f" | hand_mode={self.hand_detect_mode}"
                 if hand_scene.get("visible"):
                     stats += " | hand=1"
                 result_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -1880,6 +1753,7 @@ class RealtimeEngine:
             if depth_age >= 0:
                 stats += f" | depth_age={depth_age:.1f}s"
         stats += f" | dev={'cuda' if self.use_cuda else 'cpu'} | fp16={1 if infer_half else 0} | cpu_t={self.cpu_threads}"
+        stats += f" | hand_mode={self.hand_detect_mode}"
         stats += f" | build={APP_BUILD}"
         if depth_enabled:
             stats += f" | depth_model={self.depth_model_name}"
