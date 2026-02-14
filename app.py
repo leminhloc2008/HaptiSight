@@ -54,7 +54,10 @@ ACCURACY_RETRY_ENABLED = os.getenv("ACCURACY_RETRY_ENABLED", "1").strip().lower(
 ACCURACY_RETRY_CONF = float(os.getenv("ACCURACY_RETRY_CONF", "0.16"))
 ACCURACY_RETRY_IMG = int(os.getenv("ACCURACY_RETRY_IMG", "768"))
 APP_BUILD = os.getenv("APP_BUILD", "2026-02-14-enact12-ui-gemini-billing-guard")
-HF_FALLBACK_URL = os.getenv("HF_FALLBACK_URL", "").strip()
+HF_FALLBACK_URL = os.getenv(
+    "HF_FALLBACK_URL",
+    "https://huggingface.co/spaces/lml2008/haptisight-realtime-gemini",
+).strip()
 try:
     MODAL_BILLING_LEFT_USD = float(os.getenv("MODAL_BILLING_LEFT_USD", "-1"))
 except Exception:
